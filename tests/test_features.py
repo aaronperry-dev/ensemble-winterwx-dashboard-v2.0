@@ -17,8 +17,17 @@ def P(ra=0, sn=0, fz=0, pl=0):
 
 # ------------------------------------------------------------------ freezing-rain cap
 def test_cap_moves_excess_freezing_rain_to_snow_when_the_model_says_mostly_frozen():
-    out = cap_freezing_rain(P(sn=22, fz=78), np.array([71.0], np.float32))          # the real Rockies case
-    assert out[:, 0].tolist() == [0, 71, 29, 0]                                      # liquid share limited to 100 - 71 = 29 %
+    out = cap_freezing_rain(P(sn=22, fz=78), np.array([95.0], np.float32))          # model: 95 % frozen
+    assert out[:, 0].tolist() == [0, 95, 5, 0]                                       # liquid share limited to 100 - 95 = 5 %
+    out = cap_freezing_rain(P(sn=22, fz=78), np.array([71.0], np.float32), min_frozen=0)
+    assert out[:, 0].tolist() == [0, 71, 29, 0]                                      # a full cap is still available
+
+
+def test_cap_does_nothing_below_the_frozen_threshold():
+    zr = P(sn=22, fz=78)                                                             # ASOS check: CPOFP < 90 does not discriminate
+    assert (cap_freezing_rain(zr, np.array([71.0], np.float32)) == zr).all()
+    assert (cap_freezing_rain(zr, np.array([89.9], np.float32)) == zr).all()
+    assert cap_freezing_rain(zr, np.array([90.0], np.float32))[2, 0] == 10
 
 
 def test_cap_splits_the_excess_between_snow_and_sleet_by_their_shares():
@@ -36,7 +45,7 @@ def test_cap_is_one_sided_and_ignores_unknown():
 
 
 def test_cap_all_excess_goes_to_snow_when_no_frozen_type_yet():
-    assert cap_freezing_rain(P(fz=100), np.array([80.0], np.float32))[:, 0].tolist() == [0, 80, 20, 0]
+    assert cap_freezing_rain(P(fz=100), np.array([95.0], np.float32))[:, 0].tolist() == [0, 95, 5, 0]
 
 
 # ------------------------------------------------------------------ step averaging
@@ -121,7 +130,7 @@ class Weather(Fake):
         probs[0 if fhr == 3 else 1] = 100
         probs[:, 0, 0] = [0, 30, 70, 0]                                              # cell (0, 0): the cold-top case
         probs[:, 1, 1] = [0, 0, 100, 0]                                              # cell (1, 1): freezing rain at 2.85 C -> rain
-        cp = np.full((NY, NX), 50.0, np.float32); cp[0, 0] = 80.0
+        cp = np.full((NY, NX), 50.0, np.float32); cp[0, 0] = 95.0
         code = np.full((NY, NX), 0 if fhr == 3 else 1, np.uint8)
         t2 = np.full((NY, NX), 270.0, np.float32); t2[1, 1] = 276.0                  # cell (1, 1) is 2.85 C
         return {**r, "probs": probs, "cpofp": cp, "ncep": code, "t2": t2}
@@ -132,7 +141,7 @@ def test_run_applies_cap_step_average_and_stores_ncep_and_swe(tmp_path):
     assert rc == 0
     run = tmp_path / man["base"]
     pt3, pt6 = read_bin(run / "ptype/f003.bin.gz"), read_bin(run / "ptype/f006.bin.gz")
-    assert pt3["probs"][:, 0, 0, 0].tolist() == [0, 80, 20, 0]                       # cap: 70 -> 20, excess 50 -> snow
+    assert pt3["probs"][:, 0, 0, 0].tolist() == [0, 95, 5, 0]                        # cap: 70 -> 5, excess 65 -> snow
     assert pt6["probs"][:, 0, 5, 5].tolist() == [0, 100, 0, 0]                       # the map shows the end-of-step type
     assert pt3["probs"][:, 0, 1, 1].tolist() == [100, 0, 0, 0]                       # 2 m temperature gate: too warm for freezing rain
     assert (pt3["ncep"][:, 3, 3] == 0).all() and (pt6["ncep"][:, 3, 3] == 1).all()
@@ -140,7 +149,7 @@ def test_run_applies_cap_step_average_and_stores_ncep_and_swe(tmp_path):
     # member 0: 3 mm per 3 h.  f003 is all rain -> no snow; f006 averages rain (start) and snow (end) -> half snow
     assert np.isclose(c3["swe_mm"][0, 5, 5], 0.0) and np.isclose(c6["swe_mm"][0, 5, 5], 1.5, atol=0.02)
     assert np.isclose(c6["snow_cm"][0, 5, 5], 1.5 * 12 / 10, atol=0.1)               # SLR 12 here
-    assert np.isclose(c6["zr_mm"][0, 0, 0], 2 * 3 * 0.2, atol=0.05)                  # capped to 20 % in both steps, 3 mm each
+    assert np.isclose(c6["zr_mm"][0, 0, 0], 2 * 3 * 0.05, atol=0.05)                 # capped to 5 % in both steps, 3 mm each
     # accumulations add up: types sum to the QPF wherever there is a type
     tot = c6["swe_mm"] + c6["zr_mm"] + c6["pl_mm"]
     assert (tot <= c6["qpf_mm"] + 0.1).all()

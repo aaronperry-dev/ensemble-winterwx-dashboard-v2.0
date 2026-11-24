@@ -78,6 +78,7 @@ SNOW_CM_PER_COUNT = 0.1   # uint16 cumulative snowfall            (max 6553 cm)
 ZR_MM_PER_COUNT = 0.01    # uint16 cumulative freezing-rain liquid equivalent (max 655 mm)
 PL_MM_PER_COUNT = 0.01    # uint16 cumulative sleet / ice-pellet liquid equivalent (max 655 mm)
 SWE_MM_PER_COUNT = 0.02   # uint16 cumulative snow liquid equivalent, any snow ratio can be applied in the viewer (max 1310 mm)
+CPOFP_CAP_MIN_PCT = 90.0   # the model's liquid-fraction cap on freezing rain applies only where it says at least this % is frozen
 FZRA_MAX_T2_C = 1.0    # freezing rain needs a (near-)freezing surface: above this 2 m temperature its share becomes rain
 PL_MAX_T2_C = 3.0      # ice pellets survive to the surface only in cold air (RAP/HRRR use <= 3 C): above this their share becomes rain
 NCEP_NONE, NCEP_UNKNOWN = 254, 255   # codes in the ptype file's NCEP-type plane (0-3 = RA, SN, FZRA, PL)

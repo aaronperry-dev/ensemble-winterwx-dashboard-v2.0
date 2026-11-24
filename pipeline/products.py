@@ -79,7 +79,7 @@ def surface_temperature_gates(probs: np.ndarray, t2_c: np.ndarray | None, fz_max
     return np.rint(np.minimum(out, 100.0)).astype(np.uint8)
 
 
-def cap_freezing_rain(probs: np.ndarray, cpofp: np.ndarray | None) -> np.ndarray:
+def cap_freezing_rain(probs: np.ndarray, cpofp: np.ndarray | None, min_frozen: float = C.CPOFP_CAP_MIN_PCT) -> np.ndarray:
     """Do not let freezing rain exceed the liquid fraction that the model's own microphysics reports.
 
     probs: (4, ...) percent [RA, SN, FZRA, PL] (Revised Bourgouin); cpofp: percent frozen precipitation from the GEFS
@@ -87,11 +87,16 @@ def cap_freezing_rain(probs: np.ndarray, cpofp: np.ndarray | None) -> np.ndarray
     the model says is liquid (100 - CPOFP), the excess moves to the frozen types in proportion to their current share
     (all of it to snow if both are zero).  One-sided on purpose: rain is never turned into snow, so marginal-temperature
     events do not gain the snow that NCEP's own 10:1 maps are criticized for (Manikin 2021).
+
+    The cap applies only where the model says at least `min_frozen` percent is frozen.  Checked against ASOS present weather
+    (14 freezing-rain days, 2023-26), CPOFP separates freezing rain from snow only at its extreme: where Bourgouin says
+    freezing rain, ZR was observed 30-33 % of the time for CPOFP below 90 but only 17 % at 90 and above.  A full cap
+    (min_frozen=0) halved freezing-rain detection (POD 0.50 -> 0.25) with almost no drop in false alarms.
     """
     if cpofp is None:
         return probs
     p = probs.astype(np.float32)
-    known = np.isfinite(cpofp) & (cpofp >= 0) & (cpofp <= 100)
+    known = np.isfinite(cpofp) & (cpofp >= max(min_frozen, 0.0)) & (cpofp <= 100)
     liquid_cap = np.where(known, (100.0 - np.where(known, cpofp, 0.0)) / 100.0, 1.0) * p.sum(axis=0)
     excess = np.where(p[2] > liquid_cap, p[2] - liquid_cap, 0.0)
     frozen = p[1] + p[3]
