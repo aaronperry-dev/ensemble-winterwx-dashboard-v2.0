@@ -20,7 +20,7 @@ run is still filling in).
 
 | Step | Detail |
 |---|---|
-| Members | `c00` + `p01…p30` (31), 0.5° `pgrb2a` + `pgrb2b`, 3-hourly to F240 |
+| Members / range | `c00` + `p01…p30` (31), 0.5° `pgrb2a` + `pgrb2b`. **10 days: 80 three-hourly steps, F003 to F240** (`--max-fhr` accepts up to 384; steps beyond F240 are 6-hourly) |
 | Source order | AWS S3 `noaa-gefs-pds` → Google Cloud `gfs-ensemble-forecast-system` → NOMADS GRIB filter → NOMADS HTTP |
 | Byte ranges | S3, GCS and NOMADS HTTP: read the `.idx`, then request only the messages needed (byte-adjacent ones merged). About 20 requests and 5 MB per member-step |
 | NOMADS GRIB filter | A server-side CGI, so there is no file to byte-range. It subsets by variable, level and lat/lon box instead |
@@ -33,7 +33,7 @@ Run it locally:
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest -q tests
+python -m pytest -q tests && node --test tests/ensstats.test.js
 python -m pipeline.run --out site/data --max-fhr 48 --workers 6
 python -m pipeline.site --out site
 cd site && python -m http.server 8000
@@ -61,7 +61,12 @@ documented in `pipeline/encode.py`.
 * MapLibre GL JS 4.7.1 (vendored), a self-hosted Natural Earth + US Census basemap (countries, states/provinces, counties, rivers, lakes), a graticule, and a canvas label layer with collision handling. There is no tile or font server.
 * A custom WebGL2 layer paints the data with crisp class edges at any zoom, using the NWS-style ramps from the three reference images.
 * Hover (desktop) or tap (phone) for a tooltip with mean, median, min, max, 10th/90th percentile, chance of exceeding thresholds, a dot strip of all 31 members and, for type, member counts and mean Bourgouin probabilities. Click to pin.
-* Statistics: mean, median, percentiles, min/max, probability of at least *x*, and any single member. Units can be switched between inches and mm/cm.
+* Statistics (computed in the browser from the 31 member totals of the selected window):
+  * **Min, P5, P10, P25, P50, Mean, P75, P90, P95, Max.** Percentiles interpolate linearly between ranked members (31 members, so P5 sits between the 2nd and 3rd lowest).
+  * **PMM**, the probability-matched mean (Ebert 2001). The ensemble mean supplies the spatial pattern. All member values pooled over the whole map are ranked, and every 31st value is dealt back onto the mean field by rank. Amplitudes are no longer smoothed away, and the map-wide total stays close to the mean's.
+  * **LPMM**, the local probability-matched mean (Clark 2017; Snook et al. 2019/2020). The same matching is done independently in a square neighborhood around each grid cell, which avoids mixing very different regimes (a coastal low and a dry interior). The neighborhood is selectable (±1° to ±4°; default ±2°, about 220 km). Published LPM settings are tuned for 3-km convection-allowing ensembles, so treat the default as a starting point for 0.5° GEFS. Cells whose ensemble mean is zero stay zero.
+  * Probability of at least *x*, and any single member. Units can be switched between inches and mm/cm.
+  * The PMM/LPMM math is in `ensstats.js` and tested with `node --test tests/ensstats.test.js` (distribution matching, rank order, equality with PMM for a map-sized window, brute-force comparison).
 * State is kept in the URL hash, so links are shareable.
 
 ## Layout

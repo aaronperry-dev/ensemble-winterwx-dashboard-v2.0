@@ -32,6 +32,11 @@
 
   <label class="lbl" for="stat">Statistic / member</label>
   <select id="stat"></select>
+  <div id="lpmm-wrap" hidden>
+    <label class="lbl" for="lpmm-r">LPMM neighborhood</label>
+    <select id="lpmm-r"><option value="2">&plusmn;1&deg; (~110 km)</option><option value="4">&plusmn;2&deg; (~220 km)</option><option value="6">&plusmn;3&deg; (~330 km)</option><option value="8">&plusmn;4&deg; (~440 km)</option></select>
+  </div>
+  <p id="stat-help" class="fine" hidden></p>
 
   <div class="row2">
     <div><label class="lbl" for="units">Units</label>
@@ -59,6 +64,7 @@
     <summary>Method &amp; data</summary>
     <p><b>Precip type</b> uses the Revised Bourgouin algorithm (Birk et&nbsp;al. 2021, <i>Wea. Forecasting</i>) on each member's wet-bulb profile; its four probabilities (rain, snow, freezing rain, sleet) split that member's QPF.</p>
     <p><b>Snowfall</b> = 3-hr QPF &times; snow share &times; snow-to-liquid ratio (Kuchera: warmest temperature surface&ndash;500&nbsp;hPa), summed over the period.</p>
+    <p><b>Statistics</b> are computed per grid cell from the 31 member totals (percentiles interpolate between ranked members). <b>PMM</b> (Ebert 2001) keeps the ensemble-mean pattern but takes its amplitudes from all members pooled over the map; <b>LPMM</b> (Clark 2017; Snook et&nbsp;al.) does the same inside a neighborhood around each point.</p>
     <p><b>Periods</b> are rolling windows ending at the selected hour. Before the window fits in the run, the total since initialization is shown.</p>
     <p>Hover (desktop) or tap (phone) the map for the ensemble breakdown at that point. Click to pin.</p>
     <p class="fine">Data: NOAA/NCEP GEFS 0.5&deg;. Basemap: Natural Earth, US Census cartographic boundaries.</p>
@@ -92,6 +98,7 @@
 <script src="colors.js"></script>
 <script src="wxlayer.js"></script>
 <script src="basemap.js"></script>
+<script src="ensstats.js"></script>
 <script src="viewer.js"></script>
 </body>
 </html>

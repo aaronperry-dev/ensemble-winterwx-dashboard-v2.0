@@ -119,3 +119,8 @@ details p { margin: 8px 0; line-height: 1.4; } .fine { font-size: 11px; color: v
   .maplibregl-ctrl-bottom-left { margin-bottom: calc(var(--bar) + 4px); margin-left: 0; }
   .maplibregl-ctrl-scale { font-size: 9.5px; }
 }
+
+.tip-map { display: flex; justify-content: space-between; align-items: baseline; margin: 4px 0 6px; padding: 5px 8px; background: #eef3fb; border: 1px solid #c9d7f2; border-radius: 6px; }
+.tip-map b { font-size: 15px; font-variant-numeric: tabular-nums; }
+#lpmm-wrap .lbl { margin-top: 8px; }
+#stat-help { margin: 6px 0 0; line-height: 1.35; }

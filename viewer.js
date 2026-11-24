@@ -18,7 +18,7 @@ const PROB_EDGES = [10, 20, 30, 40, 50, 60, 70, 80, 90];
 
 const S = {
   man: null, base: '', steps: [], byFhr: new Map(), idx: 0,
-  product: 'qpf', period: 24, stat: 'mean', units: 'in', opacity: 0.82,
+  product: 'qpf', period: 24, stat: 'mean', lpmmR: 4, units: 'in', opacity: 0.82,
   cur: null, token: 0, pin: null, playing: false, timer: null,
 };
 let map, wx, labels, labelData, pinMarker;
@@ -73,28 +73,24 @@ async function windowValues(kind, i, period) {
 
 const toDisp = (kind, v) => (kind === 'qpf' ? v / MM_PER_IN : v / CM_PER_IN);   // raw -> inches
 
-function sortSmall(a, n) {
-  for (let i = 1; i < n; i++) { const x = a[i]; let j = i - 1; while (j >= 0 && a[j] > x) { a[j + 1] = a[j]; j--; } a[j + 1] = x; }
-}
-function pct(sorted, n, p) { const f = p * (n - 1), lo = Math.floor(f), hi = Math.ceil(f); return sorted[lo] + (sorted[hi] - sorted[lo]) * (f - lo); }
+const pct = EnsStats.percentile;
+const FIELD_MEMO = new Map();          // PMM / LPMM fields are the expensive ones: keep the last few
 
-function reduceStat(kind, data, M, N, stat) {
-  const out = new Float32Array(N), c = kind === 'qpf' ? 1 / MM_PER_IN : 1 / CM_PER_IN;
-  const scratch = new Float32Array(M);
-  if (isMem(stat)) { const m = +stat.slice(1); for (let i = 0; i < N; i++) out[i] = data[m * N + i] * c; return out; }
+/** One display-unit (inches) field from the member totals of a window. */
+function reduceStat(kind, win, stat) {
+  const { nmem: M, ny, nx } = win.h, N = ny * nx, data = win.data, c = kind === 'qpf' ? 1 / MM_PER_IN : 1 / CM_PER_IN;
+  if (isMem(stat)) { const out = new Float32Array(N), o = +stat.slice(1) * N; for (let i = 0; i < N; i++) out[i] = data[o + i] * c; return out; }
   if (stat.startsWith('prob:')) {
-    const thr = (+stat.slice(5)) / c;                 // inches -> raw
+    const out = new Float32Array(N), thr = (+stat.slice(5)) / c;                 // inches -> raw
     for (let i = 0; i < N; i++) { let k = 0; for (let m = 0; m < M; m++) if (data[m * N + i] >= thr) k++; out[i] = (100 * k) / M; }
     return out;
   }
-  for (let i = 0; i < N; i++) {
-    let s = 0, mx = -Infinity, mn = Infinity;
-    for (let m = 0; m < M; m++) { const v = data[m * N + i]; scratch[m] = v; s += v; if (v > mx) mx = v; if (v < mn) mn = v; }
-    let r;
-    if (stat === 'mean') r = s / M; else if (stat === 'max') r = mx; else if (stat === 'min') r = mn;
-    else { sortSmall(scratch, M); r = stat === 'median' ? pct(scratch, M, 0.5) : stat === 'p10' ? pct(scratch, M, 0.1) : pct(scratch, M, 0.9); }
-    out[i] = r * c;
-  }
+  const slow = stat === 'pmm' || stat === 'lpmm';
+  const key = slow ? [kind, S.man.init, win.w.start, win.w.end, stat, S.lpmmR].join('|') : null;
+  if (key && FIELD_MEMO.has(key)) return FIELD_MEMO.get(key);
+  const out = EnsStats.compute(data, M, ny, nx, stat, { radius: S.lpmmR });
+  for (let i = 0; i < N; i++) out[i] *= c;
+  if (key) { FIELD_MEMO.set(key, out); while (FIELD_MEMO.size > 10) FIELD_MEMO.delete(FIELD_MEMO.keys().next().value); }
   return out;
 }
 
@@ -155,7 +151,7 @@ async function refresh() {
       wx.setField(field, types); S.cur = { kind: 'ptype', d, field };
     } else {
       const win = await windowValues(S.product, S.idx, S.period); if (tok !== S.token) return;
-      const field = reduceStat(S.product, win.data, win.h.nmem, win.h.ny * win.h.nx, S.stat);
+      const field = reduceStat(S.product, win, S.stat);
       const c = classesFor(); wx.setClasses(c.edges, c.colors); wx.setField(field);
       S.cur = { kind: S.product, win, field };
     }
@@ -186,8 +182,10 @@ function productName() {
 }
 function statName() {
   const s = S.stat;
-  if (s === 'mean') return 'Ensemble mean'; if (s === 'median') return 'Ensemble median'; if (s === 'max') return 'Ensemble maximum';
-  if (s === 'min') return 'Ensemble minimum'; if (s === 'p10') return '10th percentile'; if (s === 'p90') return '90th percentile';
+  if (s === 'mean') return 'Ensemble mean'; if (s === 'max') return 'Ensemble maximum'; if (s === 'min') return 'Ensemble minimum';
+  if (s === 'pmm') return 'Probability-matched mean (PMM)';
+  if (s === 'lpmm') return `Local prob.-matched mean (LPMM \u00b1${S.lpmmR / 2}\u00b0)`;
+  if (EnsStats.isPct(s)) return s === 'p50' ? '50th percentile (median)' : `${s.slice(1)}th percentile`;
   if (s === 'ens') return 'Most likely type (ensemble)';
   if (s.startsWith('prob:')) {
     const v = +s.slice(5);
@@ -305,9 +303,17 @@ function tipHTML(ll, pt) {
   const mean = vals.reduce((a, b) => a + b, 0) / M, med = pct(sorted, M, 0.5);
   const kind = S.product, f = (x) => fmtVal(kind, x);
   const sel = isMem(S.stat) ? +S.stat.slice(1) : -1;
-  const rows = [['Mean', mean], ['Median', med], ['10th pct', pct(sorted, M, 0.1)], ['90th pct', pct(sorted, M, 0.9)], ['Min', sorted[0]], ['Max', sorted[M - 1]]];
-  let h = head + `<div class="tip-t">${productName()} · ${$('#t-valid').textContent}</div><div class="tip-grid">`;
-  rows.forEach(([k, v]) => { h += `<span>${k}</span><b>${f(v)}</b>`; });
+  const val = { min: sorted[0], max: sorted[M - 1], mean };
+  EnsStats.PCTS.forEach((p) => { val[`p${p}`] = pct(sorted, M, p / 100); });
+  const nm2 = (k) => (k === 'mean' ? 'Mean' : k === 'min' ? 'Min' : k === 'max' ? 'Max' : k.toUpperCase());
+  const ord = EnsStats.TIP_ORDER, half = ord.length / 2;
+  let h = head + `<div class="tip-t">${productName()} \u00b7 ${$('#t-valid').textContent}</div>`;
+  if ((S.stat === 'pmm' || S.stat === 'lpmm') && cur.field) {
+    const fv = cellValues(ll, cur.field, 1, N, win.h);
+    if (fv) h += `<div class="tip-map"><span>${S.stat === 'pmm' ? 'PMM' : `LPMM \u00b1${S.lpmmR / 2}\u00b0`}</span><b>${f(fv.v[0])}</b></div>`;
+  }
+  h += '<div class="tip-grid">';
+  for (let r = 0; r < half; r++) h += `<span>${nm2(ord[r])}</span><b>${f(val[ord[r]])}</b><span>${nm2(ord[r + half])}</span><b>${f(val[ord[r + half]])}</b>`;
   h += '</div><div class="tip-s">Chance of at least</div><div class="tip-p">';
   PROB_THRESH[kind].forEach((t) => {
     const p = Math.round((100 * vals.filter((v) => v >= t).length) / M);
@@ -377,7 +383,9 @@ function statOptions() {
     g('Ensemble', [['ens', 'Most likely type (QPF-weighted)']]);
     g('Probability of type', PTYPE.names.map((n, t) => [`prob:${t}`, `${PTYPE.long[t]} (% of members)`]));
   } else {
-    g('Ensemble', [['mean', 'Mean'], ['median', 'Median (50th)'], ['p10', '10th percentile'], ['p90', '90th percentile'], ['min', 'Minimum'], ['max', 'Maximum']]);
+    g('Ensemble statistics', [['min', 'Minimum'], ['p5', '5th percentile'], ['p10', '10th percentile'], ['p25', '25th percentile'], ['p50', '50th percentile (median)'],
+      ['mean', 'Mean'], ['p75', '75th percentile'], ['p90', '90th percentile'], ['p95', '95th percentile'], ['max', 'Maximum']]);
+    g('Probability-matched mean', [['pmm', 'PMM (whole map)'], ['lpmm', 'LPMM (local neighborhood)']]);
     g('Probability of at least', PROB_THRESH[S.product].map((t) => [`prob:${t}`, `${t}″ (${fmtEdge2(t)})`]));
   }
   g('Single member', M.map((m, k) => [`m${k}`, k === 0 ? 'Control (c00)' : `Member ${m}`]));
@@ -390,10 +398,14 @@ function syncControls() {
   const valid = [...$('#stat').options].map((o) => o.value);
   if (!valid.includes(S.stat)) S.stat = S.product === 'ptype' ? 'ens' : 'mean';
   $('#stat').value = S.stat;
+  $('#lpmm-wrap').hidden = S.stat !== 'lpmm'; $('#lpmm-r').value = String(S.lpmmR);
+  const help = { pmm: 'Ensemble-mean pattern with amplitudes re-assigned from all members pooled over the whole map, so peaks are not smoothed away.',
+    lpmm: `Same matching done separately inside a \u00b1${S.lpmmR / 2}\u00b0 neighborhood around each point: keeps local detail and avoids mixing different weather regimes.` }[S.stat];
+  $('#stat-help').textContent = help || ''; $('#stat-help').hidden = !help;
   document.querySelectorAll('#product button').forEach((b) => b.classList.toggle('on', b.dataset.v === S.product));
   document.querySelectorAll('#period button').forEach((b) => { b.classList.toggle('on', String(b.dataset.v) === String(S.period)); b.disabled = S.product === 'ptype' && b.dataset.v !== 'step'; });
   $('#period-note').hidden = S.product !== 'ptype';
-  location.hash = `p=${S.product}&per=${S.period}&s=${S.stat}&f=${S.steps[S.idx].fhr}`;
+  location.hash = `p=${S.product}&per=${S.period}&s=${S.stat}${S.stat === 'lpmm' ? `&r=${S.lpmmR}` : ''}&f=${S.steps[S.idx].fhr}`;
 }
 
 function buildUI() {
@@ -402,6 +414,7 @@ function buildUI() {
   $('#product').onclick = (e) => { const b = e.target.closest('button'); if (!b) return; S.product = b.dataset.v; if (S.product === 'ptype') S.period = 'step'; else if (S.period === 'step') S.period = 24; syncControls(); refresh(); };
   $('#period').onclick = (e) => { const b = e.target.closest('button'); if (!b || b.disabled) return; S.period = b.dataset.v === 'step' ? 'step' : +b.dataset.v; syncControls(); refresh(); };
   $('#stat').onchange = (e) => { S.stat = e.target.value; syncControls(); refresh(); };
+  $('#lpmm-r').onchange = (e) => { S.lpmmR = +e.target.value; syncControls(); refresh(); };
   $('#units').onchange = (e) => { S.units = e.target.value; updateLegend(); updateTip(); statRefresh(); };
   $('#opacity').oninput = (e) => wx.setOpacity(+e.target.value / 100);
   const vis = (id, layers) => ($(id).onchange = (e) => layers.forEach((l) => map.setLayoutProperty(l, 'visibility', e.target.checked ? 'visible' : 'none')));
@@ -423,7 +436,8 @@ function buildUI() {
   $('#legend-toggle').onclick = () => $('#legend').classList.toggle('min');
   // day labels under slider
   const days = $('#days'); days.innerHTML = ''; let prev = '';
-  S.steps.forEach((s, i) => { const d = new Date(s.valid), key = d.toDateString(); if (key !== prev) { prev = key; const sp = document.createElement('span'); sp.textContent = d.toLocaleDateString([], { weekday: 'short', day: 'numeric' }); sp.style.left = `${(i / (S.steps.length - 1)) * 100}%`; days.appendChild(sp); } });
+  const every = innerWidth < 760 && S.steps.length > 40 ? 2 : 1; let nd = 0;
+  S.steps.forEach((s, i) => { const d = new Date(s.valid), key = d.toDateString(); if (key !== prev) { prev = key; if (nd++ % every) return; const sp = document.createElement('span'); sp.textContent = d.toLocaleDateString([], { weekday: 'short', day: 'numeric' }); const fx = i / (S.steps.length - 1); sp.style.left = `${fx * 100}%`; if (fx > 0.93) sp.style.transform = 'translateX(-100%)'; days.appendChild(sp); } });
 }
 const statRefresh = () => refresh();
 function step(d) { const j = Math.max(0, Math.min(S.steps.length - 1, S.idx + d)); if (j === S.idx) { if (S.playing) togglePlay(); return; } S.idx = j; syncControls(); refresh(); }
@@ -446,7 +460,8 @@ async function boot() {
   S.product = ['qpf', 'snow', 'ptype'].includes(hs.p) ? hs.p : 'qpf';
   S.period = S.product === 'ptype' ? 'step' : hs.per === 'step' ? 'step' : [6, 12, 24, 48].includes(+hs.per) ? +hs.per : 24;
   const want = +hs.f || 24; let best = S.steps.length - 1; S.steps.forEach((s, i) => { if (s.fhr === want) best = i; }); S.idx = Math.min(best, S.steps.length - 1);
-  if (hs.s) S.stat = hs.s;
+  if (hs.s) S.stat = hs.s === 'median' ? 'p50' : hs.s;
+  if ([2, 4, 6, 8].includes(+hs.r)) S.lpmmR = +hs.r;
   await new Promise((res) => (map.loaded() ? res() : map.once('load', res)));
   wx = new WxLayer({ opacity: S.opacity }); wx.setDomain(man.domain);
   map.addLayer(wx, 'counties-hit');

@@ -110,3 +110,10 @@ def test_encode_roundtrip(tmp_path):
 def test_quantize_saturates():
     assert quantize(np.array([1e9]), 0.05)[0] == 65535
     assert quantize(np.array([-3.0]), 0.05)[0] == 0
+
+
+def test_default_run_covers_ten_days_three_hourly():
+    hrs = C.forecast_hours()
+    assert C.DEFAULT_MAX_FHR == 240 and hrs[0] == 3 and hrs[-1] == 240
+    assert len(hrs) == 80 and all(b - a == 3 for a, b in zip(hrs, hrs[1:]))
+    assert C.forecast_hours(252)[-2:] == [246, 252]        # 6-hourly beyond f240 if ever requested

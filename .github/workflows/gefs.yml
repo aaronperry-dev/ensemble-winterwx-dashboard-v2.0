@@ -46,8 +46,14 @@ jobs:
       - name: Install
         run: pip install -r requirements-dev.txt
 
-      - name: Unit tests
-        run: python -m pytest -q tests
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Unit tests (Python pipeline, JS ensemble statistics)
+        run: |
+          python -m pytest -q tests
+          node --test tests/ensstats.test.js
 
       - name: Build GEFS products (31 members, byte-range pulls, AWS -> GCS -> NOMADS)
         run: |
