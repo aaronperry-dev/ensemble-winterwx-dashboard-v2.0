@@ -19,7 +19,8 @@ File layout (little-endian), 64-byte header then raw arrays:
   36      f32    scale1  kind 1: cm of snow per count
   40      f32    scale2  kind 1: mm of liquid per count, freezing rain
   44      f32    scale3  kind 1: mm of liquid per count, sleet / ice pellets
-  48..63  zero padding
+  48      u32    member bitmask: bit k set = member k (c00, p01 ...) has data in this file. 0 = legacy file, all present
+  52..63  zero padding
 
  kind 1 body:  u16 [nmem][ny][nx] cumulative QPF, snowfall, freezing rain (liquid eq.), sleet (liquid eq.), in that order.
                Any rolling window total is  cum(t) - cum(t - window)  -- two small files.
@@ -37,14 +38,25 @@ import numpy as np
 from . import config as C
 
 MAGIC = b"GWX1"
-HEADER = struct.Struct("<4sBBHHHHHffffffff")
+HEADER = struct.Struct("<4sBBHHHHHffffffffI")
 HEADER_SIZE = 64
 KIND_CUM, KIND_PTYPE = 1, 2
 
 
-def _header(kind, nmem, ny, nx, fhr, step_h, domain: C.Domain, scales=(0.0, 0.0, 0.0, 0.0), narr=0) -> bytes:
+def full_mask(nmem: int) -> int:
+    return (1 << nmem) - 1
+
+
+def mask_of(present_idx) -> int:
+    m = 0
+    for k in present_idx:
+        m |= 1 << int(k)
+    return m
+
+
+def _header(kind, nmem, ny, nx, fhr, step_h, domain: C.Domain, scales=(0.0, 0.0, 0.0, 0.0), narr=0, mask=0) -> bytes:
     raw = HEADER.pack(MAGIC, kind, narr, nmem, ny, nx, fhr, step_h,
-                      domain.lat_north, domain.lon_west, domain.res, domain.res, *scales)
+                      domain.lat_north, domain.lon_west, domain.res, domain.res, *scales, mask)
     return raw + b"\x00" * (HEADER_SIZE - len(raw))
 
 
@@ -61,34 +73,36 @@ def quantize(arr: np.ndarray, per_count: float) -> np.ndarray:
 
 
 def write_cum(path: Path, fhr: int, step_h: int, qpf_cum_mm: np.ndarray, snow_cum_cm: np.ndarray,
-              domain: C.Domain, zr_cum_mm: np.ndarray | None = None, pl_cum_mm: np.ndarray | None = None) -> int:
+              domain: C.Domain, zr_cum_mm: np.ndarray | None = None, pl_cum_mm: np.ndarray | None = None,
+              mask: int | None = None) -> int:
     m, ny, nx = qpf_cum_mm.shape
+    mask = full_mask(m) if mask is None else mask
     parts = [quantize(qpf_cum_mm, C.QPF_MM_PER_COUNT), quantize(snow_cum_cm, C.SNOW_CM_PER_COUNT)]
     scales = [C.QPF_MM_PER_COUNT, C.SNOW_CM_PER_COUNT, 0.0, 0.0]
     if zr_cum_mm is not None and pl_cum_mm is not None:
         parts += [quantize(zr_cum_mm, C.ZR_MM_PER_COUNT), quantize(pl_cum_mm, C.PL_MM_PER_COUNT)]
         scales[2:] = [C.ZR_MM_PER_COUNT, C.PL_MM_PER_COUNT]
     body = b"".join(a.astype("<u2").tobytes() for a in parts)
-    return _write_gz(Path(path), _header(KIND_CUM, m, ny, nx, fhr, step_h, domain, tuple(scales), len(parts)) + body)
+    return _write_gz(Path(path), _header(KIND_CUM, m, ny, nx, fhr, step_h, domain, tuple(scales), len(parts), mask) + body)
 
 
-def write_ptype(path: Path, fhr: int, step_h: int, probs_u8: np.ndarray, domain: C.Domain) -> int:
+def write_ptype(path: Path, fhr: int, step_h: int, probs_u8: np.ndarray, domain: C.Domain, mask: int | None = None) -> int:
     """probs_u8: (4, nmem, ny, nx)."""
     _, m, ny, nx = probs_u8.shape
-    hdr = _header(KIND_PTYPE, m, ny, nx, fhr, step_h, domain)
+    hdr = _header(KIND_PTYPE, m, ny, nx, fhr, step_h, domain, mask=full_mask(m) if mask is None else mask)
     return _write_gz(Path(path), hdr + np.ascontiguousarray(probs_u8, dtype=np.uint8).tobytes())
 
 
 def read_bin(path: Path) -> dict:
     """Reference reader (used by tests; the browser has its own JS reader)."""
     raw = gzip.open(path, "rb").read()
-    (magic, kind, narr, nmem, ny, nx, fhr, step_h, lat0, lon0, dlat, dlon, s0, s1, s2, s3) = HEADER.unpack_from(raw)
+    (magic, kind, narr, nmem, ny, nx, fhr, step_h, lat0, lon0, dlat, dlon, s0, s1, s2, s3, mask) = HEADER.unpack_from(raw)
     if magic != MAGIC:
         raise ValueError("bad magic")
     n = nmem * ny * nx
     off = HEADER_SIZE
     out = {"kind": kind, "nmem": nmem, "ny": ny, "nx": nx, "fhr": fhr, "step_h": step_h,
-           "lat0": lat0, "lon0": lon0, "dlat": dlat, "dlon": dlon}
+           "lat0": lat0, "lon0": lon0, "dlat": dlat, "dlon": dlon, "mask": mask or full_mask(nmem)}
     if kind == KIND_CUM:
         narr = narr or 2
         arrs = [np.frombuffer(raw, "<u2", n, off + 2 * n * k).reshape(nmem, ny, nx) for k in range(narr)]

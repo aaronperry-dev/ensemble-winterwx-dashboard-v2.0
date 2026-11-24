@@ -95,3 +95,24 @@ test('LPMM speed on a full GEFS-sized domain is interactive', () => {
   for (const R of [2, 4, 6]) { const t = performance.now(); E.lpmm(d, M, ny, nx, R); const ms = performance.now() - t; console.log(`LPMM R=${R}: ${ms.toFixed(0)} ms`); assert.ok(ms < 4000); }
   const t = performance.now(); E.pmm(d, M, ny * nx); console.log(`PMM: ${(performance.now() - t).toFixed(0)} ms`);
 });
+
+test('membersFromMask lists present members (bit k = member k); 0 means a legacy file with everyone', () => {
+  assert.deepEqual(E.membersFromMask(0, 4), [0, 1, 2, 3]);
+  assert.deepEqual(E.membersFromMask(0b1011, 4), [0, 1, 3]);
+  const full = 2 ** 31 - 1, m7 = full - 2 ** 7;
+  const got = E.membersFromMask(m7, 31);
+  assert.equal(got.length, 30); assert.ok(!got.includes(7) && got.includes(30) && got.includes(0));
+  assert.equal(E.membersFromMask(2 ** 31 + 1, 32).join(), '0,31');         // bit 31 must not go negative
+});
+
+test('statistics over a compacted member set ignore the dropped member entirely', () => {
+  const M = 31, ny = 6, nx = 8, N = ny * nx, d = synth(M, ny, nx, 9), keep = E.membersFromMask(2 ** 31 - 1 - 2 ** 7, 31);
+  const poisoned = Float32Array.from(d); for (let i = 0; i < N; i++) poisoned[7 * N + i] = 1e6;       // the dropped member's plane is garbage
+  const compact = new Float32Array(keep.length * N); keep.forEach((m, j) => compact.set(poisoned.subarray(m * N, (m + 1) * N), j * N));
+  const ref = new Float32Array(keep.length * N); keep.forEach((m, j) => ref.set(d.subarray(m * N, (m + 1) * N), j * N));
+  for (const s of ['mean', 'max', 'p50', 'p95', 'pmm', 'lpmm']) {
+    const a = E.compute(compact, keep.length, ny, nx, s, { radius: 2 }), b = E.compute(ref, keep.length, ny, nx, s, { radius: 2 });
+    for (let i = 0; i < N; i++) assert.equal(a[i], b[i]);
+    assert.ok(Math.max(...a) < 1e5);
+  }
+});

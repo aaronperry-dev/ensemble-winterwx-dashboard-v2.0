@@ -50,7 +50,7 @@ async function fetchBin(url) {
     const dv = new DataView(buf);
     const h = { kind: dv.getUint8(4), narr: dv.getUint8(5) || 2, nmem: dv.getUint16(6, true), ny: dv.getUint16(8, true), nx: dv.getUint16(10, true),
       fhr: dv.getUint16(12, true), stepH: dv.getUint16(14, true), s0: dv.getFloat32(32, true), s1: dv.getFloat32(36, true),
-      s2: dv.getFloat32(40, true), s3: dv.getFloat32(44, true) };
+      s2: dv.getFloat32(40, true), s3: dv.getFloat32(44, true), mask: dv.getUint32(48, true) };      // mask 0 = legacy file, all members
     const n = h.nmem * h.ny * h.nx;
     if (h.kind === 1) {
       const o = { h }; ['q', 's', 'z', 'p'].slice(0, h.narr).forEach((k, i) => { o[k] = new Uint16Array(buf, 64 + 2 * n * i, n); });
@@ -71,14 +71,22 @@ function windowFor(i, period) {
 }
 
 /** Member totals over the window, raw units (mm for QPF, cm for snow). Float32Array(M*N). */
-async function windowValues(kind, i, period) {
+async function windowValues(kind, i, period, extraMask) {
   const w = windowFor(i, period), key = PRODUCTS[kind].key;
   const [a, b] = await Promise.all([loadCum(w.end), w.start > 0 ? loadCum(w.start) : null]);
   if (!a[key]) throw new Error(`${PRODUCTS[kind].name} is not in this run's files yet (the next pipeline run adds it)`);
-  const scale = a.h[PRODUCTS[kind].scale], n = a[key].length, out = new Float32Array(n), A = a[key];
-  if (b) { const B = b[key]; for (let k = 0; k < n; k++) out[k] = Math.max(0, A[k] - B[k]) * scale; }
-  else for (let k = 0; k < n; k++) out[k] = A[k] * scale;
-  return { data: out, w, h: a.h };
+  // Members missing from either file (or from `extraMask`) are left out; everything downstream works on the compacted set.
+  const full = 2 ** a.h.nmem - 1, mk = (h) => h.mask || full;
+  let mask = mk(a.h); if (b) mask = Number(BigInt(mask) & BigInt(mk(b.h))); if (extraMask) mask = Number(BigInt(mask) & BigInt(extraMask));
+  const members = EnsStats.membersFromMask(mask, a.h.nmem);
+  if (!members.length) throw new Error('no ensemble member has data for this window');
+  const scale = a.h[PRODUCTS[kind].scale], N = a.h.ny * a.h.nx, out = new Float32Array(members.length * N), A = a[key];
+  members.forEach((m, j) => {
+    const o = m * N, d = j * N;
+    if (b) { const B = b[key]; for (let k = 0; k < N; k++) out[d + k] = Math.max(0, A[o + k] - B[o + k]) * scale; }
+    else for (let k = 0; k < N; k++) out[d + k] = A[o + k] * scale;
+  });
+  return { data: out, w, h: { ...a.h, nmem: members.length }, members };
 }
 
 const toDisp = (kind, v) => v / siPerIn(kind);   // raw (mm or cm) -> inches
@@ -89,7 +97,8 @@ const FIELD_MEMO = new Map();          // PMM / LPMM fields are the expensive on
 /** One display-unit (inches) field from the member totals of a window. */
 function reduceStat(kind, win, stat) {
   const { nmem: M, ny, nx } = win.h, N = ny * nx, data = win.data, c = 1 / siPerIn(kind);
-  if (isMem(stat)) { const out = new Float32Array(N), o = +stat.slice(1) * N; for (let i = 0; i < N; i++) out[i] = data[o + i] * c; return out; }
+  if (isMem(stat) && win.members.includes(+stat.slice(1))) { const out = new Float32Array(N), o = win.members.indexOf(+stat.slice(1)) * N; for (let i = 0; i < N; i++) out[i] = data[o + i] * c; return out; }
+  if (isMem(stat)) stat = 'mean';                   // that member has no data for this window
   if (stat.startsWith('prob:')) {
     const out = new Float32Array(N), thr = (+stat.slice(5)) / c;                 // inches -> raw
     for (let i = 0; i < N; i++) { let k = 0; for (let m = 0; m < M; m++) if (data[m * N + i] >= thr) k++; out[i] = (100 * k) / M; }
@@ -114,17 +123,20 @@ const dbzOf = (rate, type) => (rate <= 0 ? 0 : type === 1 ? 32.5 + 22.1 * Math.l
 
 async function ptypeData() {
   const st = S.steps[S.idx];
-  const [pt, qw] = await Promise.all([loadPtype(st.fhr), windowValues('qpf', S.idx, 'step')]);
-  return { p: pt.p, q: qw.data, h: pt.h, w: qw.w };
+  const pt = await loadPtype(st.fhr), qw = await windowValues('qpf', S.idx, 'step', pt.h.mask);
+  const M = qw.members.length, N = pt.h.ny * pt.h.nx, full = pt.h.nmem * N, p = new Uint8Array(4 * M * N);
+  for (let t = 0; t < 4; t++) qw.members.forEach((m, j) => p.set(pt.p.subarray(t * full + m * N, t * full + (m + 1) * N), t * M * N + j * N));
+  return { p, q: qw.data, h: { ...pt.h, nmem: M }, w: qw.w, members: qw.members };
 }
 
 function buildPtype(d, stat) {
+  if (isMem(stat) && !d.members.includes(+stat.slice(1))) stat = 'ens';
   const { p, q, h, w } = d, M = h.nmem, N = h.ny * h.nx, rateDiv = w.hours || 3;
   const field = new Float32Array(N), types = new Float32Array(N), tot = M * N;
   const share = (m, i, t) => { let s = 0; for (let k = 0; k < 4; k++) s += p[k * tot + m * N + i]; return s ? p[t * tot + m * N + i] / s : 0; };
   for (let i = 0; i < N; i++) {
-    if (isMem(stat)) {
-      const m = +stat.slice(1), t = domType(p, N, m, i);
+    if (isMem(stat) && d.members.includes(+stat.slice(1))) {
+      const m = d.members.indexOf(+stat.slice(1)), t = domType(p, N, m, i);
       if (t >= 0) { field[i] = dbzOf(q[m * N + i] / rateDiv, t); types[i] = t; }
     } else if (stat.startsWith('prob:')) {
       const want = +stat.slice(5); let k = 0;
@@ -182,6 +194,7 @@ function prefetch() {
 const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
 const fmtLocal = (d) => d.toLocaleString([], { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', timeZoneName: 'short' });
 const fmtUtc = (d) => `${d.toISOString().slice(5, 10).replace('-', '/')} ${d.toISOString().slice(11, 13)}Z`;
+const stepN = (i) => (S.steps[i].n ?? S.man.members.length);
 const pad = (n, w = 3) => String(n).padStart(w, '0');
 
 function productName() {
@@ -204,6 +217,13 @@ function statName() {
   const m = +s.slice(1); return m === 0 ? 'Control (c00)' : `Member p${pad(m, 2)}`;
 }
 
+function updateWarn() {
+  const st = S.steps[S.idx], tot = S.man.members.length, el = $('#t-warn');
+  if (st.n === undefined || st.n >= tot) { el.hidden = true; return; }
+  const gone = S.man.members.filter((m, k) => st.mask && !(Math.floor(st.mask / 2 ** k) % 2)).join(', ');
+  el.hidden = false; el.textContent = `\u26a0 ${st.n} of ${tot} members at this hour (missing: ${gone}). Statistics use the members that are available.`;
+}
+
 function updateTitle() {
   const st = S.steps[S.idx], valid = new Date(st.valid), init = new Date(S.man.init);
   const w = windowFor(S.idx, S.product === 'ptype' ? 'step' : S.period);
@@ -212,7 +232,8 @@ function updateTitle() {
   $('#t-valid').textContent = S.product === 'ptype' || w.hours <= st.step_h
     ? `Valid ${fmtLocal(valid)} (${fmtUtc(valid)})`
     : `${fmtLocal(startD)} → ${fmtLocal(valid)}`;
-  $('#t-init').textContent = `GEFS ${init.toISOString().slice(0, 10)} ${init.toISOString().slice(11, 13)}Z run · F${pad(st.fhr)} · ${S.man.members.length} members`;
+  $('#t-init').textContent = `GEFS ${init.toISOString().slice(0, 10)} ${init.toISOString().slice(11, 13)}Z run · F${pad(st.fhr)} · ${stepN(S.idx)} members`;
+  updateWarn();
   $('#fh').textContent = `F${pad(st.fhr)}`;
   $('#fh-time').textContent = `${fmtLocal(valid)}`;
   $('#fh-utc').textContent = fmtUtc(valid);
@@ -246,7 +267,7 @@ function updateLegend() {
   }
   const c = classesFor();
   const kind = S.product === 'ptype' ? 'ptype' : S.product;
-  hdr.textContent = c.prob ? `Probability (% of ${S.man.members.length} members)` :
+  hdr.textContent = c.prob ? `Probability (% of ${stepN(S.idx)} members)` :
     `${c.title} (${S.units === 'in' ? 'in' : PRODUCTS[S.product].si})`;
   for (let i = c.colors.length - 1; i >= 0; i--) {
     const row = document.createElement('div'); row.className = 'lg-row';
@@ -399,7 +420,8 @@ function statOptions() {
     g('Probability-matched mean', [['pmm', 'PMM (whole map)'], ['lpmm', 'LPMM (local neighborhood)']]);
     g('Probability of at least', PROB_THRESH[S.product].map((t) => [`prob:${t}`, `${t}″ (${fmtEdge2(t)})`]));
   }
-  g('Single member', M.map((m, k) => [`m${k}`, k === 0 ? 'Control (c00)' : `Member ${m}`]));
+  const here = EnsStats.membersFromMask(S.steps[S.idx].mask, M.length);
+  g('Single member', here.map((k) => [`m${k}`, k === 0 ? 'Control (c00)' : `Member ${M[k]}`]));
   return opts.join('');
 }
 const fmtEdge2 = (t) => { const x = t * siPerIn(S.product); return `${x < 10 ? x.toFixed(x < 1 ? 2 : 1) : Math.round(x)} ${PRODUCTS[S.product].si}`; };

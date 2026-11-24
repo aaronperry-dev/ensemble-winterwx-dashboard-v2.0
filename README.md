@@ -35,7 +35,7 @@ Run it locally:
 ```bash
 pip install -r requirements-dev.txt
 python -m pytest -q tests && node --test tests/ensstats.test.js
-python -m pipeline.run --out site/data --max-fhr 48 --workers 6
+python -m pipeline.run --out site/data --max-fhr 48 --workers 6      # add --min-members 20 --straggler-minutes 15 to tune
 python -m pipeline.site --out site
 cd site && python -m http.server 8000
 ```
@@ -45,6 +45,22 @@ cd site && python -m http.server 8000
 The freezing-rain equation reads `ProbFZRA_i = −2.1·RE + 0.2·ME + 458`. Text extraction of the paper PDF turns the
 minus sign into a "2" and the decimal point into a ":", which reads as `−22.1`. The code uses −2.1, and a regression test
 (`test_shallow_cold_layer_is_freezing_rain`) guards it.
+
+## When members or data are missing
+
+The pipeline keeps producing every product for every forecast hour that it can. Nothing is all-or-nothing.
+
+| Situation | What happens |
+|---|---|
+| A file or request fails | Retried with backoff (`Retry-After` honored), then the next source in the chain (AWS → GCS → NOMADS filter → NOMADS HTTP) |
+| A file is not posted yet | Polled every 45 s |
+| A member is still missing after the other members of that hour arrived (`--straggler-minutes`, default 15) | **Dropped from that hour onward**; the run continues with the rest |
+| A member fails 3 times with a real error (corrupt GRIB, a missing field) | Dropped the same way, instead of ending the run |
+| Nothing arrives for `--wait-minutes` at one hour | If at least `--min-members` (default 20) have posted, the stragglers are dropped. Otherwise the run stops there and publishes the hours it has (`complete: false`) |
+| Fewer than `--min-members` would remain | The run stops there and publishes the hours it has |
+
+A dropped member is never skipped for one hour only, because GEFS accumulations are chained per member and a gap would break its totals. Each file's header holds a member bitmask and the manifest records `n`, `mask` and `dropped` for every step, so the viewer
+works on exactly the members that exist for the selected window (a window needs the member in both its end and start files), and shows a warning with the member names. Statistics, probabilities, PMM/LPMM and the single-member list all use the available members. The decision logic is the pure function `step_decision()` in `pipeline/run.py`, covered by `tests/test_policy.py` (scenario tests with a fake model: member missing from one hour on, repeated errors, a late result that must not revive a dropped member, too few members, nothing at all).
 
 ## Data format (`data/<yyyymmdd_cc>/…`, `data/latest.json`)
 

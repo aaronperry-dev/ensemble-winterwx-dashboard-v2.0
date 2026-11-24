@@ -122,5 +122,12 @@
     return perCell(data, M, N, stat);
   }
 
-  return { PCTS, TIP_ORDER, isPct, pctOf, quickselect, percentile, insertionSort, meanField, perCell, pmm, lpmm, compute };
+  /** Indices of the members flagged present in a file's bitmask (0 = legacy file: everyone). */
+  function membersFromMask(mask, nmem) {
+    const out = [];
+    for (let k = 0; k < nmem; k++) if (!mask || Math.floor(mask / 2 ** k) % 2 === 1) out.push(k);
+    return out;
+  }
+
+  return { PCTS, TIP_ORDER, membersFromMask, isPct, pctOf, quickselect, percentile, insertionSort, meanField, perCell, pmm, lpmm, compute };
 });
