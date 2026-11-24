@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>GEFS Ensemble Winter Weather — QPF · Snowfall · Precipitation Type</title>
+<meta name="description" content="31-member GEFS ensemble QPF, snowfall and Revised Bourgouin precipitation type with rolling 3/6/12/24/48-hour accumulations.">
+<link rel="stylesheet" href="maplibre-gl.css">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="map"></div>
+<canvas id="labels"></canvas>
+
+<div id="titleblock">
+  <div id="t-main">GEFS ensemble</div>
+  <div id="t-valid"></div>
+  <div id="t-init"></div>
+</div>
+
+<button id="menu" aria-label="Show or hide controls">&#9776; Controls</button>
+
+<aside id="panel" aria-label="Controls">
+  <h1>GEFS Winter Weather</h1>
+  <p class="sub">31-member ensemble &middot; QPF &middot; snowfall &middot; precip type</p>
+
+  <label class="lbl">Product</label>
+  <div id="product" class="seg"></div>
+
+  <label class="lbl">Accumulation period <small id="period-note" hidden>(type is per 3-hr step)</small></label>
+  <div id="period" class="seg"></div>
+
+  <label class="lbl" for="stat">Statistic / member</label>
+  <select id="stat"></select>
+
+  <div class="row2">
+    <div><label class="lbl" for="units">Units</label>
+      <select id="units"><option value="in">inches</option><option value="si">mm / cm</option></select></div>
+    <div><label class="lbl" for="opacity">Opacity</label>
+      <input id="opacity" type="range" min="25" max="100" value="82"></div>
+  </div>
+
+  <label class="lbl">Map layers</label>
+  <div class="checks">
+    <label><input id="tg-counties" type="checkbox" checked> Counties</label>
+    <label><input id="tg-states" type="checkbox" checked> States / provinces</label>
+    <label><input id="tg-rivers" type="checkbox" checked> Rivers</label>
+    <label><input id="tg-grat" type="checkbox" checked> Graticule</label>
+    <label><input id="tg-labels" type="checkbox" checked> Place labels</label>
+  </div>
+
+  <label class="lbl">Zoom to</label>
+  <div id="views" class="seg small">
+    <button data-v="ne">Northeast</button><button data-v="conus">CONUS</button><button data-v="mw">Midwest</button>
+    <button data-v="se">Southeast</button><button data-v="na">N. America</button>
+  </div>
+
+  <details>
+    <summary>Method &amp; data</summary>
+    <p><b>Precip type</b> uses the Revised Bourgouin algorithm (Birk et&nbsp;al. 2021, <i>Wea. Forecasting</i>) on each member's wet-bulb profile; its four probabilities (rain, snow, freezing rain, sleet) split that member's QPF.</p>
+    <p><b>Snowfall</b> = 3-hr QPF &times; snow share &times; snow-to-liquid ratio (Kuchera: warmest temperature surface&ndash;500&nbsp;hPa), summed over the period.</p>
+    <p><b>Periods</b> are rolling windows ending at the selected hour. Before the window fits in the run, the total since initialization is shown.</p>
+    <p>Hover (desktop) or tap (phone) the map for the ensemble breakdown at that point. Click to pin.</p>
+    <p class="fine">Data: NOAA/NCEP GEFS 0.5&deg;. Basemap: Natural Earth, US Census cartographic boundaries.</p>
+  </details>
+  <div id="t-gen" class="fine"></div>
+</aside>
+
+<section id="legend" aria-label="Legend">
+  <button id="legend-toggle" aria-label="Collapse legend"><span id="legend-title">Legend</span><b>&#9662;</b></button>
+  <div id="legend-body"></div>
+</section>
+
+<svg id="north" viewBox="0 0 24 34" width="22" height="31" aria-label="North arrow"><path d="M12 2 L20 28 L12 22 L4 28 Z" fill="#2b2b2b"/><path d="M12 2 L12 22 L4 28 Z" fill="#fff" stroke="#2b2b2b" stroke-width="1"/><text x="12" y="33" font-size="8" text-anchor="middle" font-family="sans-serif" fill="#2b2b2b">N</text></svg>
+
+<div id="tip" role="status" aria-live="polite"></div>
+
+<footer id="timebar">
+  <button id="prev" aria-label="Previous forecast hour">&#9664;</button>
+  <button id="play" aria-label="Play">&#9654;</button>
+  <button id="next" aria-label="Next forecast hour">&#9654;&#xFE0E;</button>
+  <div class="fh"><b id="fh">F000</b><span id="fh-time"></span><small id="fh-utc"></small></div>
+  <div class="track"><input id="slider" type="range" min="0" max="0" value="0" aria-label="Forecast hour"><div id="days"></div></div>
+</footer>
+
+<div id="credits">Ensemble: NOAA GEFS &middot; Basemap: Natural Earth, US Census &middot; Web Mercator</div>
+<div id="busy" hidden></div>
+<div id="toast" hidden></div>
+<div id="splash"><div><b>Loading GEFS ensemble&hellip;</b><p id="splash-msg">Fetching the latest run.</p></div></div>
+
+<script src="maplibre-gl.js"></script>
+<script src="colors.js"></script>
+<script src="wxlayer.js"></script>
+<script src="basemap.js"></script>
+<script src="viewer.js"></script>
+</body>
+</html>
