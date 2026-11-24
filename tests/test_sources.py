@@ -158,3 +158,36 @@ def test_non_grib_filter_reply_is_rejected(server):
     c.sources[0].http.get_bytes = lambda *a, **k: b"<html>Data file is not present</html>"
     with pytest.raises(SourceError):
         c.fetch(T, SPECS)
+
+
+def hits(*roots):
+    return [r for r, *_ in Handler.log if r in roots]
+
+
+def test_not_posted_yet_does_not_touch_nomads_until_allowed(server):
+    Handler.behaviour = {"aws": "404", "gcs": "404"}
+    c = chain(server)
+    with pytest.raises(NotAvailable):
+        c.fetch(T, SPECS, allow_origin=False)
+    assert not hits("nomads", "nomadshttp")                       # mirrors merely lack it: NCEP is left alone
+    msgs, src = c.fetch(T, SPECS, allow_origin=True)              # after the grace period NOMADS is asked
+    assert src == "nomads_filter" and msgs == WANT
+
+
+def test_mirror_errors_reach_nomads_even_when_origin_is_held_back(server):
+    Handler.behaviour = {"aws": "500", "gcs": "404"}
+    msgs, src = chain(server).fetch(T, SPECS, allow_origin=False)
+    assert src == "nomads_filter" and msgs == WANT                # a broken mirror is a real outage, not "not posted yet"
+
+
+def test_exhausted_404_budget_is_not_a_failure(server):
+    Handler.behaviour = {k: "404" for k in ("aws", "gcs", "nomads", "nomadshttp")}
+    gates = build_gates({**FAST, "nomads": {"rate": 5000.0, "burst": 50, "concurrency": 8, "max_404_per_min": 2}})
+    http = HttpClient(max_retries=1, backoff_base=0.01, backoff_cap=0.02)
+    bases = {"aws": f"{server}/aws", "gcs": f"{server}/gcs", "nomads_http": f"{server}/nomadshttp"}
+    c = SourceChain.build(("aws", "gcs", "nomads_http"), gates, http, bases)
+    for _ in range(12):                                           # far more misses than the budget allows
+        with pytest.raises(NotAvailable) as ei:                   # never a SourceError, so no strike against the member
+            c.fetch(T, SPECS)
+        assert not isinstance(ei.value, SourceError)
+    assert all(s.available() for s in c.sources)                  # and no circuit breaker opened

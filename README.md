@@ -53,7 +53,7 @@ The pipeline keeps producing every product for every forecast hour that it can. 
 | Situation | What happens |
 |---|---|
 | A file or request fails | Retried with backoff (`Retry-After` honored), then the next source in the chain (AWS → GCS → NOMADS filter → NOMADS HTTP) |
-| A file is not posted yet | Polled every 45 s |
+| A file is not posted yet | Polled every 45 s. This is not an error and never counts toward the 3 strikes. AWS and GCS are asked first; NOMADS (NCEP's own servers, with a strict request budget) is asked only for the hour being waited on, and only after the mirrors have lacked the file for `--origin-after-seconds` (default 120). A mirror that errors, rather than saying "not posted", skips that wait. When NOMADS' 404 budget is used up the pipeline simply does not ask, which is also not a failure and does not trip the circuit breaker |
 | A member is still missing after the other members of that hour arrived (`--straggler-minutes`, default 15) | **Dropped from that hour onward**; the run continues with the rest |
 | A member fails 3 times with a real error (corrupt GRIB, a missing field) | Dropped the same way, instead of ending the run |
 | Nothing arrives for `--wait-minutes` at one hour | If at least `--min-members` (default 20) have posted, the stragglers are dropped. Otherwise the run stops there and publishes the hours it has (`complete: false`) |
@@ -61,6 +61,17 @@ The pipeline keeps producing every product for every forecast hour that it can. 
 
 A dropped member is never skipped for one hour only, because GEFS accumulations are chained per member and a gap would break its totals. Each file's header holds a member bitmask and the manifest records `n`, `mask` and `dropped` for every step, so the viewer
 works on exactly the members that exist for the selected window (a window needs the member in both its end and start files), and shows a warning with the member names. Statistics, probabilities, PMM/LPMM and the single-member list all use the available members. The decision logic is the pure function `step_decision()` in `pipeline/run.py`, covered by `tests/test_policy.py` (scenario tests with a fake model: member missing from one hour on, repeated errors, a late result that must not revive a dropped member, too few members, nothing at all).
+
+## Not downloading the same cycle twice
+
+Every deploy builds a fresh site, so the only copy of a finished cycle is the one on the live Pages site. At the start of a run the pipeline reads `data/latest.json` from that site (`--reuse-from`, set by the workflow) and, if it is the **same cycle** made by the **same calculation code** (`code_rev` in the manifest) with the same members, grid and snow-ratio mode, it:
+
+* copies the published hours back from your own site (never from NOAA) and checks every file;
+* if the cycle is complete, stops there with no NOAA requests at all, so a push that only changes the viewer costs seconds;
+* if the cycle is partial, restores the running accumulators from the published files and downloads **only the missing hours**. Members dropped earlier stay dropped. Restored totals carry at most one file-quantization step of rounding (0.05 mm QPF, 0.1 cm snow);
+* falls back to a normal download when the cycle, code, members or snow mode differ, when no site exists yet, or from the first hour whose file is missing or damaged.
+
+Run the workflow by hand with `force_refresh` = true (or pass `--force`) to download everything again, for example to pick up members that were dropped on the first attempt. `code_rev` covers `bourgouin.py`, `config.py`, `encode.py`, `grib.py`, `member.py`, `products.py` and `run.py`; changes to the source/transport code or to the viewer do not invalidate published data.
 
 ## Data format (`data/<yyyymmdd_cc>/…`, `data/latest.json`)
 
@@ -81,17 +92,18 @@ documented in `pipeline/encode.py`.
 * Statistics (computed in the browser from the 31 member totals of the selected window):
   * **Min, P5, P10, P25, P50, Mean, P75, P90, P95, Max.** Percentiles interpolate linearly between ranked members (31 members, so P5 sits between the 2nd and 3rd lowest).
   * **PMM**, the probability-matched mean (Ebert 2001). The ensemble mean supplies the spatial pattern. All member values pooled over the whole map are ranked, and every 31st value is dealt back onto the mean field by rank. Amplitudes are no longer smoothed away, and the map-wide total stays close to the mean's.
-  * **LPMM**, the local probability-matched mean (Clark 2017; Snook et al. 2019/2020). The same matching is done independently in a square neighborhood around each grid cell, which avoids mixing very different regimes (a coastal low and a dry interior). The neighborhood is selectable (±1° to ±4°; default ±2°, about 220 km). Published LPM settings are tuned for 3-km convection-allowing ensembles, so treat the default as a starting point for 0.5° GEFS. Cells whose ensemble mean is zero stay zero.
-  * Probability of at least *x*, and any single member. Units can be switched between inches and mm/cm.
+  * **LPMM**, the local probability-matched mean (Clark 2017; Snook et al. 2019/2020). The same matching is done independently in a square neighborhood around each grid cell, which avoids mixing very different regimes (a coastal low and a dry interior). The neighborhood is selectable (±1° to ±4°; default ±2°, about 140 miles). Published LPM settings are tuned for 3-km convection-allowing ensembles, so treat the default as a starting point for 0.5° GEFS. Cells whose ensemble mean is zero stay zero.
+  * Probability of at least *x*, and any single member. Everything in the viewer is shown in imperial units: inches for QPF, snowfall, freezing rain and sleet, and miles/feet on the scale bar. (The data files keep mm/cm internally; conversion happens in the browser.)
   * The PMM/LPMM math is in `ensstats.js` and tested with `node --test tests/ensstats.test.js` (distribution matching, rank order, equality with PMM for a map-sized window, brute-force comparison).
+* Speed: QPF, snowfall, freezing rain and sleet share the same cumulative files, so switching among them reuses data already in memory (about 15 ms). After each view loads, the browser quietly prefetches, one file at a time at idle priority, the precip-type file, the start files for the other accumulation periods, and the next three hours in whichever direction you are stepping. It skips this when Data Saver or a 2G connection is on. PMM and LPMM run in a Web Worker (`statworker.js`) so the map stays responsive, and finished fields are memoized. Decoded files are held under a memory budget (90 MB on low-memory phones, 220 MB otherwise).
 * State is kept in the URL hash, so links are shareable.
 
 ## Layout
 
 ```
-pipeline/        data pipeline (python -m pipeline.run, pipeline.site)
+pipeline/        data pipeline (python -m pipeline.run, pipeline.site); pipeline/reuse.py skips hours already published
 tests/           pytest suite, no network needed
-index.html style.css viewer.js basemap.js wxlayer.js colors.js   viewer
+index.html style.css viewer.js basemap.js wxlayer.js colors.js ensstats.js statworker.js   viewer
 basemap_*.json   boundaries and labels (build_basemap.py regenerates them)
 maplibre-gl.*    vendored MapLibre
 .github/workflows/gefs.yml

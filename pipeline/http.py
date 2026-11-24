@@ -17,6 +17,10 @@ class NotAvailable(Exception):
     """The object does not exist (yet) on this source (HTTP 404, or 403 on object stores)."""
 
 
+class Throttled(NotAvailable):
+    """We chose not to ask (e.g. the host's 404 budget is used up). Not a failure of the host or of the member."""
+
+
 class SourceError(Exception):
     """Transient or structural failure talking to a source (after retries)."""
 
@@ -40,7 +44,7 @@ class HttpClient:
         last_err: Exception | None = None
         for attempt in range(self.max_retries + 1):
             if gate.exhausted_404_budget():
-                raise SourceError(f"{gate.name}: 404 budget exhausted, backing off")
+                raise Throttled(f"{gate.name}: 404 budget used up, not asking again yet")
             try:
                 with gate:
                     resp = self.session.get(url, headers=headers, timeout=self.timeout)

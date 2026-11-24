@@ -28,7 +28,7 @@ from pathlib import Path
 import numpy as np
 
 from . import config as C
-from . import encode
+from . import encode, reuse
 from .http import HttpClient, NotAvailable, SourceError
 from .member import compute_member_step, fetch_fields
 from .products import ApcpAccumulator, snowfall_step_cm, type_qpf_step_mm
@@ -49,11 +49,13 @@ def init_worker(cfg: dict) -> None:
 
 
 def run_task(task: tuple[str, str, str, int]) -> dict:
-    date, cycle, member, fhr = task
+    date, cycle, member, fhr, *rest = task
+    allow_origin = rest[0] if rest else True
     cfg, chain = _W["cfg"], _W["chain"]
     base = {"member": member, "fhr": fhr}
     try:
-        fields, window, used = fetch_fields(chain, date, cycle, member, fhr, domain=C.Domain(**cfg["domain"]))
+        fields, window, used = fetch_fields(chain, date, cycle, member, fhr, domain=C.Domain(**cfg["domain"]),
+                                           allow_origin=allow_origin)
         probs, slr = compute_member_step(fields, slr_mode=cfg["slr_mode"])
         return {**base, "status": "ok", "window": window, "apcp": fields["APCP"],
                 "probs": probs, "slr": slr, "sources": used}
@@ -148,8 +150,12 @@ def run(args, task_fn=None, executor=None) -> int:
 
     cfg = {"n_workers": args.workers, "order": order, "bases": bases, "domain": domain.__dict__,
            "slr_mode": args.slr_mode}
+    prior = None                              # hours of this same cycle that are already published: do not download them again
+    if getattr(args, "reuse_from", None) and not getattr(args, "force", False):
+        prior = reuse.load_prior(args.reuse_from, run_dir, cyc, members, domain, args.slr_mode, fhrs)
     own_executor = executor is None
-    ex = executor or cf.ProcessPoolExecutor(max_workers=args.workers, initializer=init_worker, initargs=(cfg,))
+    ex = executor or (None if prior and prior["complete"] else
+                      cf.ProcessPoolExecutor(max_workers=args.workers, initializer=init_worker, initargs=(cfg,)))
     task = task_fn or run_task
 
     acc = ApcpAccumulator(len(members), domain.ny, domain.nx)
@@ -169,9 +175,23 @@ def run(args, task_fn=None, executor=None) -> int:
     t_start = time.time()
     head_since = t_start
     fatal = None
+    if prior:
+        reuse.seed(prior, run_dir, acc, cum_x)
+        steps.extend(prior["steps"])
+        dropped.update(prior["dropped"])
+        alive -= set(dropped)
+        src_counts.update(prior["sources_used"])
+        head, submitted = len(steps), len(steps) - 1
+        log.info("reusing %d of %d hours already published for %s (no NOAA downloads for them)%s", head, len(fhrs), run_id,
+                 "" if head < len(fhrs) else "; nothing left to fetch")
+
+    first_miss: dict[tuple[int, str], float] = {}     # (hour, member) -> when the mirrors first said "not posted yet"
+    origin_after = getattr(args, "origin_after_seconds", 120.0)
 
     def submit(fhr: int, m: str):
-        futures[ex.submit(task, (date, cc, m, fhr))] = (fhr, m)
+        # NOMADS is asked only for the hour we are waiting on, and only once the mirrors have lacked the file a while
+        allow = head < len(fhrs) and fhr == fhrs[head] and (time.time() - first_miss.get((fhr, m), time.time())) >= origin_after
+        futures[ex.submit(task, (date, cc, m, fhr, allow))] = (fhr, m)
 
     def write_manifest(complete: bool):
         man = {
@@ -183,7 +203,8 @@ def run(args, task_fn=None, executor=None) -> int:
             "products": ["qpf", "snow", "zr", "pl", "ptype"],
             "scales": {"qpf_mm_per_count": C.QPF_MM_PER_COUNT, "snow_cm_per_count": C.SNOW_CM_PER_COUNT,
                        "zr_mm_per_count": C.ZR_MM_PER_COUNT, "pl_mm_per_count": C.PL_MM_PER_COUNT},
-            "slr_mode": args.slr_mode, "min_precip_mm": C.MIN_PRECIP_MM,
+            "slr_mode": args.slr_mode, "min_precip_mm": C.MIN_PRECIP_MM, "code_rev": reuse.code_rev(),
+            "reused_hours": len(prior["steps"]) if prior else 0,
             "min_members": pol.min_members, "dropped": dropped,
             "sources_used": src_counts, "steps": steps,
         }
@@ -219,9 +240,11 @@ def run(args, task_fn=None, executor=None) -> int:
                 if r["status"] == "ok":
                     st["res"][m] = r
                     st["t_ok"] = time.time()
+                    first_miss.pop((fhr, m), None)
                     for k, v in r["sources"].items():
                         src_counts[v] = src_counts.get(v, 0) + 1
                 elif r["status"] == "unavailable":
+                    first_miss.setdefault((fhr, m), time.time())
                     retry_q.append((time.time() + args.poll_seconds, fhr, m))
                     if fhr == fhrs[head] and blocked_since is None:
                         blocked_since = time.time()
@@ -263,7 +286,7 @@ def run(args, task_fn=None, executor=None) -> int:
                 blocked_since = None
                 head_since = time.time()
     finally:
-        if own_executor:
+        if own_executor and ex is not None:
             ex.shutdown(wait=False, cancel_futures=True)
 
     write_manifest(head >= len(fhrs))
@@ -331,8 +354,14 @@ def main(argv=None) -> int:
     ap.add_argument("--straggler-minutes", type=float, default=15.0,
                     help="once --min-members have arrived, drop members that are still missing this long after the last arrival")
     ap.add_argument("--poll-seconds", type=float, default=45.0)
+    ap.add_argument("--origin-after-seconds", type=float, default=120.0,
+                    help="ask NOMADS for a file only after AWS/GCS have lacked it this long (it is simply not posted yet)")
     ap.add_argument("--sources", default=",".join(C.DEFAULT_SOURCE_ORDER))
     ap.add_argument("--base", action="append", help="override a source base URL: name=url (testing)")
+    ap.add_argument("--reuse-from", default=os.environ.get("GEFS_REUSE_FROM"), metavar="URL",
+                    help="base URL of the published data folder (e.g. https://user.github.io/repo/data). Hours of this same "
+                         "cycle that it already holds are copied from there instead of being downloaded from NOAA again")
+    ap.add_argument("--force", action="store_true", help="ignore published data and download everything again")
     ap.add_argument("--slr-mode", default=C.SLR_MODE, help='"kuchera" or "fixed:12.5"')
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)

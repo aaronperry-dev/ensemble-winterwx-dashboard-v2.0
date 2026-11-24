@@ -11,7 +11,7 @@ from .sources import SourceChain, Target, required_fields
 
 
 def fetch_fields(chain: SourceChain, date: str, cycle: str, member: str, fhr: int,
-                 levels=C.PLEVELS, domain: C.Domain | None = None):
+                 levels=C.PLEVELS, domain: C.Domain | None = None, allow_origin: bool = True):
     """Download + decode all required fields. Returns (fields, apcp_window, {a|b: source})."""
     domain = domain or C.Domain()
     specs = required_fields(levels)
@@ -21,7 +21,7 @@ def fetch_fields(chain: SourceChain, date: str, cycle: str, member: str, fhr: in
         sp = [s for s in specs if s.file == kind]
         if not sp:
             continue
-        msgs, src = chain.fetch(Target(date, cycle, member, fhr, kind), sp)
+        msgs, src = chain.fetch(Target(date, cycle, member, fhr, kind), sp, allow_origin=allow_origin)
         arrs, win = decode_messages(msgs, domain)
         fields.update(arrs)
         used[kind] = src

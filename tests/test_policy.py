@@ -61,7 +61,7 @@ class Fake:
         self.unavailable, self.error = dict(unavailable), dict(error)    # member -> first fhr affected (or {(m,fhr)} below)
 
     def __call__(self, task):
-        date, cc, m, fhr = task
+        date, cc, m, fhr, *_ = task
         base = {"member": m, "fhr": fhr}
         if m in self.unavailable and fhr >= self.unavailable[m]:
             return {**base, "status": "unavailable", "msg": "not posted"}
@@ -135,3 +135,22 @@ def test_too_few_members_stops_but_keeps_what_was_written(tmp_path):
 def test_nothing_published_at_all_returns_error_code(tmp_path):
     rc, man = go(tmp_path, Fake(unavailable={m: 3 for m in C.MEMBERS}))
     assert rc == 2 and man["steps"] == [] and not man["complete"]
+
+
+def test_nomads_is_only_allowed_for_the_head_hour_after_the_grace(tmp_path):
+    seen = []
+
+    class Rec(Fake):
+        def __call__(self, task):
+            seen.append((task[3], task[4]))
+            return super().__call__(task)
+
+    go(tmp_path, Rec(), origin_after_seconds=3600.0)
+    assert seen and not any(allow for _, allow in seen)           # mirrors answered; NOMADS never allowed
+
+    seen.clear()
+    unavailable = {m: 6 for m in ("p01",)}                        # p01 not posted from f006: the head hour must wait on it
+    go(tmp_path, Rec(unavailable=unavailable), origin_after_seconds=0.0, wait_minutes=0.004)
+    heads = [(f, a) for f, a in seen if f == 6]
+    assert any(a for _, a in heads)                               # head hour, after the grace -> NOMADS allowed
+    assert not any(a for f, a in seen if f > 6)                   # look-ahead hours never spend NOMADS requests

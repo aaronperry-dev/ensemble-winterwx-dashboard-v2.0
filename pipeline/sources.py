@@ -73,6 +73,8 @@ class Source:
     name = "base"
     gate_key = "base"
 
+    origin = False          # True for NOMADS (NCEP's own servers): last resort, so the mirrors are asked first
+
     def __init__(self, http: HttpClient, gates: dict[str, HostGate], base: str | None = None):
         self.http = http
         self.gate: HostGate = gates[self.gate_key]
@@ -175,6 +177,7 @@ class GcsSource(IdxRangeSource):
 
 class NomadsHttpSource(IdxRangeSource):
     name, gate_key = "nomads_http", "nomads"
+    origin = True
 
     def __init__(self, http, gates, base=None):
         super().__init__(http, gates, base or C.NOMADS_HTTP_BASE)
@@ -184,6 +187,7 @@ class NomadsFilterSource(Source):
     """NOMADS grib_filter CGI: server-side variable/level/sub-region subsetting."""
 
     name, gate_key = "nomads_filter", "nomads"
+    origin = True
 
     def __init__(self, http, gates, base=None, domain: C.Domain | None = None):
         super().__init__(http, gates, base or C.NOMADS_FILTER_BASE)
@@ -251,12 +255,19 @@ class SourceChain:
                 srcs.append(klass(http, gates, bases.get(name)))
         return cls(srcs)
 
-    def fetch(self, t: Target, specs: list[FieldSpec]) -> tuple[list[bytes], str]:
+    def fetch(self, t: Target, specs: list[FieldSpec], allow_origin: bool = True) -> tuple[list[bytes], str]:
         """Return (messages, source_name). Raises NotAvailable if no source has it yet,
-        SourceError if sources exist but all failed."""
-        saw_error, errors = False, []
+        SourceError if sources exist but all failed.
+
+        `allow_origin=False` holds NOMADS back while the mirrors (AWS, GCS) answer a clean "not posted yet":
+        a file that is simply not out yet is not a reason to spend NCEP's request budget. If a mirror errors
+        or is down, NOMADS is tried regardless."""
+        saw_error, mirror_missing, mirror_error, errors = False, False, False, []
         for s in self.sources:
             if not s.available():
+                continue
+            if s.origin and not allow_origin and mirror_missing and not mirror_error:
+                errors.append(f"{s.name}: deferred")
                 continue
             try:
                 msgs = s.fetch(t, specs)
@@ -264,9 +275,11 @@ class SourceChain:
                 return msgs, s.name
             except NotAvailable as e:
                 errors.append(f"{s.name}: not available")
+                mirror_missing = mirror_missing or not s.origin
                 log.debug("%s", e)
             except SourceError as e:
                 saw_error = True
+                mirror_error = mirror_error or not s.origin
                 errors.append(f"{s.name}: {e}")
                 log.warning("%s failed for %s: %s -- trying next source", s.name, t.file, e)
         if saw_error:

@@ -141,3 +141,13 @@ def test_type_qpf_split_conserves_liquid():
     assert parts[:, 0, 0, 0].sum() == 0
     only_zr = np.zeros_like(probs); only_zr[2] = 100
     assert np.allclose(type_qpf_step_mm(q, only_zr)[2], q) and type_qpf_step_mm(q, only_zr)[3].max() == 0
+
+
+def test_site_ships_every_script_the_page_loads():
+    import re
+    from pipeline.site import ASSETS, ROOT
+    html = (ROOT / "index.html").read_text()
+    srcs = re.findall(r'<script src="([^"]+)"', html)
+    assert srcs and all(s in ASSETS for s in srcs), srcs
+    assert "statworker.js" in ASSETS            # loaded by viewer.js via new Worker(...)
+    assert "importScripts('ensstats.js')" in (ROOT / "statworker.js").read_text()

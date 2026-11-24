@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="icon" href="data:,">
 <title>GEFS Ensemble Winter Weather — QPF · Snow · Ice · Precipitation Type</title>
 <meta name="description" content="31-member GEFS ensemble QPF, snowfall, freezing rain, sleet and Revised Bourgouin precipitation type with rolling 3/6/12/24/48-hour accumulations, 10 days out.">
 <link rel="stylesheet" href="maplibre-gl.css">
@@ -35,13 +36,11 @@
   <select id="stat"></select>
   <div id="lpmm-wrap" hidden>
     <label class="lbl" for="lpmm-r">LPMM neighborhood</label>
-    <select id="lpmm-r"><option value="2">&plusmn;1&deg; (~110 km)</option><option value="4">&plusmn;2&deg; (~220 km)</option><option value="6">&plusmn;3&deg; (~330 km)</option><option value="8">&plusmn;4&deg; (~440 km)</option></select>
+    <select id="lpmm-r"><option value="2">&plusmn;1&deg; (~70 mi)</option><option value="4">&plusmn;2&deg; (~140 mi)</option><option value="6">&plusmn;3&deg; (~210 mi)</option><option value="8">&plusmn;4&deg; (~280 mi)</option></select>
   </div>
   <p id="stat-help" class="fine" hidden></p>
 
   <div class="row2">
-    <div><label class="lbl" for="units">Units</label>
-      <select id="units"><option value="in">inches</option><option value="si">mm / cm</option></select></div>
     <div><label class="lbl" for="opacity">Opacity</label>
       <input id="opacity" type="range" min="25" max="100" value="82"></div>
   </div>
@@ -64,7 +63,7 @@
   <details>
     <summary>Method &amp; data</summary>
     <p><b>Precip type</b> uses the Revised Bourgouin algorithm (Birk et&nbsp;al. 2021, <i>Wea. Forecasting</i>) on each member's wet-bulb profile; its four probabilities (rain, snow, freezing rain, sleet) split that member's QPF.</p>
-    <p><b>Snowfall</b> = 3-hr QPF &times; snow share &times; snow-to-liquid ratio (Kuchera: warmest temperature surface&ndash;500&nbsp;hPa), summed over the period.</p>
+    <p><b>Snowfall</b> = 3-hr QPF &times; snow share &times; snow-to-liquid ratio (Kuchera: warmest temperature surface&ndash;500&nbsp;mb), summed over the period.</p>
     <p><b>Freezing rain</b> and <b>sleet</b> are the liquid-equivalent part of each member's QPF that the Bourgouin probabilities assign to that type. Freezing rain is not radial ice accretion (no wind, surface or icing-efficiency adjustment); sleet is liquid, not pellet depth.</p>
     <p><b>Statistics</b> are computed per grid cell from the 31 member totals (percentiles interpolate between ranked members). <b>PMM</b> (Ebert 2001) keeps the ensemble-mean pattern but takes its amplitudes from all members pooled over the map; <b>LPMM</b> (Clark 2017; Snook et&nbsp;al.) does the same inside a neighborhood around each point.</p>
     <p><b>Periods</b> are rolling windows ending at the selected hour. Before the window fits in the run, the total since initialization is shown.</p>
