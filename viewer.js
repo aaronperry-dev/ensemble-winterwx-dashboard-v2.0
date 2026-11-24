@@ -184,11 +184,11 @@ function buildPtype(d, stat) {
       const want = +stat.slice(6); let k = 0, known = 0;
       for (let m = 0; m < M; m++) { const b = ncep[m * N + i]; if (b === 255) continue; known++; if (b === want) k++; }
       field[i] = known ? (100 * k) / known : 0; types[i] = want;
-    } else if (stat === 'agree') {                        // members where both methods name the same type
+    } else if (stat === 'agree') {                        // of members where BOTH methods name a type, the share naming the same one
       let both = 0, tot2 = 0;
       for (let m = 0; m < M; m++) {
         const a = domType(p, N, m, i), b = ncep[m * N + i];
-        if (b === 255 || (a < 0 && b > 3)) continue;      // no NCEP data, or neither method has a type: not counted
+        if (a < 0 || b > 3) continue;                     // one method has no type here (dry, or NCEP flag not set at this hour): not a type disagreement
         tot2++; if (a === b) both++;
       }
       field[i] = tot2 ? (100 * both) / tot2 : 0; types[i] = 0;
@@ -368,7 +368,8 @@ function placeName(pt) {
   return { line1: cName ? `${cName}${county.properties.s ? ', ' + county.properties.s : ''}` : stName || '', line2: [cName ? stName : '', cc].filter(Boolean).join(' · ') };
 }
 
-const fmtVal = (kind, inches) => `${inches < 0.1 && inches > 0 ? inches.toFixed(3) : inches.toFixed(inches < 10 ? 2 : 1)}″`;
+/* Display precision: snowfall to tenths of an inch; QPF, freezing rain and sleet (liquid) to hundredths. */
+const fmtVal = (kind, inches) => `${inches.toFixed(kind === 'snow' ? 1 : 2)}″`;
 
 function stripSVG(vals, mean, med, kind, selected) {
   const W = 268, H = 40, pad = 6, n = vals.length, mx = Math.max(...vals, 1e-9) * 1.04;
@@ -434,7 +435,7 @@ function ptypeTip(ll, d) {
     for (let m = 0; m < M; m++) {
       const b = d.n[m * N + i], a = domType(p, N, m, i); if (b === 255) continue;
       known++; if (b < 4) nc[b]++;
-      if (a >= 0 || b < 4) { either++; if (a === b) agree++; }
+      if (a >= 0 && b < 4) { either++; if (a === b) agree++; }
     }
     h2 += '</div><div class="tip-s">NCEP dominant type (members)</div><div class="tip-p">';
     order.forEach((t) => { h2 += `<span><i class="sw" style="background:${PTYPE.ramps[PTYPE.names[t]][18]}"></i>${PTYPE.long[t]}</span><i><u style="width:${known ? (100 * nc[t]) / known : 0}%"></u></i><b>${nc[t]}</b>`; });
@@ -506,7 +507,7 @@ function syncControls() {
   const help = { pmm: 'Ensemble-mean pattern with amplitudes re-assigned from all members pooled over the whole map, so peaks are not smoothed away.',
     lpmm: `Same matching done separately inside a \u00b1${lpmmMi()}-mile neighborhood around each point: keeps local detail and avoids mixing different weather regimes.`,
     'ens-n': 'The type NCEP\u2019s own post-processor picked for each member (dominant of four wet-bulb schemes), weighted by QPF.',
-    agree: 'Share of members, at each point, where Revised Bourgouin and NCEP name the same type. Low values mark places where the type depends on the method.' }[S.stat];
+    agree: 'Of the members where both Revised Bourgouin and NCEP name a type, the share naming the same one. Low values mark places where the type depends on the method.' }[S.stat];
   $('#stat-help').textContent = help || ''; $('#stat-help').hidden = !help;
   document.querySelectorAll('#product button').forEach((b) => b.classList.toggle('on', b.dataset.v === S.product));
   document.querySelectorAll('#period button').forEach((b) => { b.classList.toggle('on', String(b.dataset.v) === String(S.period)); b.disabled = S.product === 'ptype' && b.dataset.v !== 'step'; });

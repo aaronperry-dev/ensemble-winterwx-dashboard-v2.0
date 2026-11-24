@@ -327,6 +327,7 @@ def finalize_step(fhr, prev_fhr, members, res, acc, cum_x, run_dir, domain, step
     acc.add(win, apcp)
     qpf = acc.step(fhr, prev_fhr)                                         # (M, ny, nx) mm
     wet = qpf >= C.MIN_PRECIP_MM
+    ncep = np.where(wet | (ncep == C.NCEP_UNKNOWN), ncep, C.NCEP_NONE).astype(np.uint8)   # same wet mask as Bourgouin: no type for trace amounts
     probs = cap_freezing_rain(probs, cpofp if np.isfinite(cpofp).any() else None)
     probs = (probs * wet[None]).astype(np.uint8)                          # what the ptype map shows: end-of-step type
     carry = carry if carry is not None else {"probs": None}

@@ -128,6 +128,25 @@ def test_run_applies_cap_step_average_and_stores_ncep_and_swe(tmp_path):
     assert (tot <= c6["qpf_mm"] + 0.1).all()
 
 
+class Trace(Weather):
+    """Cell (7, 7) gets a trace of precipitation (0.02 mm per step) while NCEP's flag says rain."""
+
+    def __call__(self, task):
+        r = super().__call__(task)
+        if r["status"] == "ok":
+            r["apcp"] = r["apcp"].copy(); r["apcp"][7, 7] = 0.02
+        return r
+
+
+def test_ncep_type_is_dropped_where_the_member_is_dry_by_the_bourgouin_wet_mask(tmp_path):
+    rc, man = go(tmp_path, Trace(), max_fhr=6)
+    assert rc == 0
+    pt = read_bin(tmp_path / man["base"] / "ptype/f006.bin.gz")
+    assert (pt["probs"][:, :, 7, 7] == 0).all()                                      # Bourgouin: dry
+    assert (pt["ncep"][:, 7, 7] == C.NCEP_NONE).all()                                # NCEP follows the same mask
+    assert (pt["ncep"][:, 5, 5] == 1).all()                                          # wet cells keep NCEP's type
+
+
 def test_resuming_matches_an_uninterrupted_run_with_the_new_state(tmp_path):
     import functools, http.server, threading
     live = tmp_path / "live"
