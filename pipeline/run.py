@@ -1,8 +1,10 @@
 """Command-line entry point.
 
-    python -m pipeline.run --out site/data                 # newest cycle, 31 members, f003..f240
-    python -m pipeline.run --out site/data --max-fhr 24    # quick test
-    python -m pipeline.run --out site/data --cycle 2026112406 --wait-minutes 0
+    python -m pipeline.run --out site/data/gefs                       # newest GEFS cycle, 31 members, f003..f240
+    python -m pipeline.run --family ifs  --out site/data/ifs          # ECMWF IFS ENS (50 members, 00/12Z)
+    python -m pipeline.run --family geps --out site/data/geps         # ECCC GEPS (21 members, 00/12Z)
+    python -m pipeline.run --out site/data/gefs --max-fhr 24          # quick test
+    python -m pipeline.run --out site/data/gefs --cycle 2026112406 --wait-minutes 0
 
 Failure policy: a member that stays missing (or keeps failing) is dropped from that forecast hour onward and the
 run continues with the rest, as long as at least --min-members remain; the files and manifest record which members
@@ -20,6 +22,7 @@ import datetime as dt
 import json
 import logging
 import os
+import shutil
 import sys
 import time
 from dataclasses import dataclass
@@ -28,7 +31,7 @@ from pathlib import Path
 import numpy as np
 
 from . import config as C
-from . import encode, reuse
+from . import encode, families, geps, ifs, reuse
 from .http import HttpClient, NotAvailable, SourceError
 from .member import compute_member_step, cpofp_from, fetch_fields
 from .products import (ApcpAccumulator, cap_freezing_rain, snowfall_step_cm, step_average_shares, surface_temperature_gates,
@@ -42,45 +45,80 @@ log = logging.getLogger("gefs")
 _W: dict = {}
 
 
+def build_chain(fam: families.Family, gates, order, bases, domain: C.Domain):
+    """The fetcher for one family: a source chain (GEFS), IFS open data, or the GEPS datamart."""
+    if fam.key == "ifs":
+        return ifs.IfsChain(ifs.build_sources(gates, HttpClient(), bases), domain, fam.levels)
+    if fam.key == "geps":
+        return geps.GepsChain(gates, domain, fam.levels, HttpClient(), (bases or {}).get("msc"))
+    return SourceChain.build(order=order, gates=gates, http=HttpClient(), bases=bases, domain=domain)
+
+
 def init_worker(cfg: dict) -> None:
+    fam = families.get(cfg.get("family", "gefs"))
     gates = build_gates(C.HOST_POLICIES, cfg["n_workers"])
-    _W["chain"] = SourceChain.build(order=cfg["order"], gates=gates, http=HttpClient(),
-                                    bases=cfg.get("bases"), domain=C.Domain(**cfg["domain"]))
+    _W["chain"] = build_chain(fam, gates, cfg["order"], cfg.get("bases"), C.Domain(**cfg["domain"]))
     _W["cfg"] = cfg
+    _W["fam"] = fam
+
+
+def _member_result(base: dict, fam: families.Family, fields: dict, window, used, slr_mode: str) -> dict:
+    probs, slr = compute_member_step(fields, levels=fam.levels, slr_mode=slr_mode)
+    return {**base, "status": "ok", "window": window, "apcp": fields["APCP"], "probs": probs, "slr": slr,
+            "cpofp": cpofp_from(fields) if fam.uses_cpofp else None, "t2": fields["T2"], "sources": used}
 
 
 def run_task(task: tuple[str, str, str, int]) -> dict:
-    date, cycle, member, fhr, *rest = task
+    date, cycle, unit, fhr, *rest = task
     allow_origin = rest[0] if rest else True
-    cfg, chain = _W["cfg"], _W["chain"]
-    base = {"member": member, "fhr": fhr}
+    cfg, chain, fam = _W["cfg"], _W["chain"], _W.get("fam") or families.get(_W["cfg"].get("family", "gefs"))
+    base = {"member": unit, "fhr": fhr}
     try:
-        fields, window, used = fetch_fields(chain, date, cycle, member, fhr, domain=C.Domain(**cfg["domain"]),
-                                           allow_origin=allow_origin)
-        probs, slr = compute_member_step(fields, slr_mode=cfg["slr_mode"])
-        cpofp = cpofp_from(fields)
-        return {**base, "status": "ok", "window": window, "apcp": fields["APCP"],
-                "probs": probs, "slr": slr, "cpofp": cpofp, "t2": fields["T2"], "sources": used}
+        if fam.key == "geps":
+            by_n, window, used = chain.fetch_step(date, cycle, fhr, allow_origin=allow_origin)
+            mem = {fam.members[n]: _member_result({"member": fam.members[n], "fhr": fhr}, fam, f, window, used, cfg["slr_mode"])
+                   for n, f in by_n.items() if n < len(fam.members)}
+            return {**base, "status": "ok", "window": window, "sources": used, "members": mem}
+        if fam.key == "ifs":
+            fields, window, used = chain.fetch_member_step(date, cycle, unit, fhr, allow_origin=allow_origin)
+        else:
+            fields, window, used = fetch_fields(chain, date, cycle, unit, fhr, levels=fam.levels,
+                                               domain=C.Domain(**cfg["domain"]), allow_origin=allow_origin)
+        return _member_result(base, fam, fields, window, used, cfg["slr_mode"])
     except NotAvailable as e:
         return {**base, "status": "unavailable", "msg": str(e)}
     except Exception as e:  # noqa: BLE001 - report everything back to the scheduler
         return {**base, "status": "error", "msg": f"{type(e).__name__}: {e}"}
 
 
+def flatten_results(res: dict) -> dict:
+    """Per-task results -> per-member results (a GEPS task carries all of its members)."""
+    out: dict = {}
+    for unit, r in res.items():
+        if "members" in r:
+            out.update(r["members"])
+        else:
+            out[unit] = r
+    return out
+
+
 # ----------------------------------------------------------------------------- cycle choice
-def floor_cycle(now: dt.datetime) -> dt.datetime:
-    return now.replace(hour=now.hour - now.hour % 6, minute=0, second=0, microsecond=0)
+def floor_cycle(now: dt.datetime, every: int = 6) -> dt.datetime:
+    return now.replace(hour=now.hour - now.hour % every, minute=0, second=0, microsecond=0)
 
 
-def choose_cycle(chain: SourceChain, now: dt.datetime, tries: int = 4) -> dt.datetime | None:
-    """Newest cycle whose last-posted member/product has its first step available."""
-    cyc = floor_cycle(now)
+def choose_cycle(chain, now: dt.datetime, tries: int = 4, family: families.Family | None = None) -> dt.datetime | None:
+    """Newest cycle whose first step is available (GEFS: probes the last-posted member, p30)."""
+    fam = family or families.get("gefs")
+    every = 12 if fam.cycle_hours == (0, 12) else 6
+    cyc = floor_cycle(now, every)
     for _ in range(tries):
-        t = Target(cyc.strftime("%Y%m%d"), cyc.strftime("%H"), "p30", 3, "b")
-        if chain.exists(t):
+        d, c = cyc.strftime("%Y%m%d"), cyc.strftime("%H")
+        ok = chain.exists(d, c, 3) if fam.key in ("ifs", "geps") else chain.exists(Target(d, c, "p30", 3, "b"))
+        if ok:
             return cyc
-        log.info("cycle %s not available yet; trying the previous one", cyc.strftime("%Y%m%d%H"))
-        cyc -= dt.timedelta(hours=6)
+        log.info("%s cycle %s not available yet; trying the previous one", fam.label, cyc.strftime("%Y%m%d%H"))
+        cyc -= dt.timedelta(hours=every)
     return None
 
 
@@ -127,34 +165,42 @@ def step_decision(alive: set, have: set, failed: set, now: float, last_progress:
 def run(args, task_fn=None, executor=None) -> int:
     """task_fn / executor are injectable for tests; by default a process pool runs run_task."""
     domain = C.Domain()
-    members = list(C.MEMBERS[: args.members])
-    fhrs = C.forecast_hours(args.max_fhr)
+    fam = families.get(getattr(args, "family", None) or "gefs")
+    members = list(fam.members[: args.members]) if getattr(args, "members", None) else list(fam.members)
+    units = fam.task_units(members)                    # what one fetch task covers: a member, or (GEPS) the whole hour
+    fhrs = fam.forecast_hours(args.max_fhr if args.max_fhr else None)
+    manifest_name = getattr(args, "manifest", None) or "latest.json"
     bases = dict(kv.split("=", 1) for kv in (args.base or []))
     order = tuple(args.sources.split(","))
-    pol = Policy(min_members=min(getattr(args, "min_members", 20), len(members)),
+    pol = Policy(min_members=min(getattr(args, "min_members", None) or fam.min_members, len(units)),
                  grace_s=getattr(args, "straggler_minutes", 15.0) * 60.0, deadline_s=args.wait_minutes * 60.0)
 
-    probe = SourceChain.build(order=order, gates=build_gates(C.HOST_POLICIES, 1), bases=bases, domain=domain)
     now = dt.datetime.now(dt.timezone.utc)
     if args.cycle == "auto":
-        cyc = choose_cycle(probe, now)
+        probe = build_chain(fam, build_gates(C.HOST_POLICIES, 1), order, bases, domain)
+        cyc = choose_cycle(probe, now, family=fam)
         if cyc is None:
-            log.error("no GEFS cycle is available from any source")
+            log.error("no %s cycle is available from any source", fam.label)
             return 2
     else:
         cyc = dt.datetime.strptime(args.cycle, "%Y%m%d%H").replace(tzinfo=dt.timezone.utc)
+        if cyc.hour not in fam.cycle_hours:
+            cyc = floor_cycle(cyc, 12)
+            log.warning("%s runs at %s Z only: using %s", fam.label, "/".join(f"{h:02d}" for h in fam.cycle_hours), cyc.strftime("%Y%m%d%H"))
     date, cc = cyc.strftime("%Y%m%d"), cyc.strftime("%H")
     run_id = f"{date}_{cc}"
     out = Path(args.out)
     run_dir = out / run_id
-    log.info("GEFS %s: %d members x %d steps, sources=%s, workers=%d, min members=%d", run_id, len(members),
-             len(fhrs), ",".join(order), args.workers, pol.min_members)
+    args.resolved_cycle = cyc
+    log.info("%s %s: %d members x %d steps, sources=%s, workers=%d, min members=%d", fam.label, run_id, len(members),
+             len(fhrs), ",".join(order) if fam.key == "gefs" else fam.key, args.workers, pol.min_members)
 
     cfg = {"n_workers": args.workers, "order": order, "bases": bases, "domain": domain.__dict__,
-           "slr_mode": args.slr_mode}
+           "slr_mode": args.slr_mode, "family": fam.key}
     prior = None                              # hours of this same cycle that are already published: do not download them again
     if getattr(args, "reuse_from", None) and not getattr(args, "force", False):
-        prior = reuse.load_prior(args.reuse_from, run_dir, cyc, members, domain, args.slr_mode, fhrs)
+        prior = reuse.load_prior(args.reuse_from, run_dir, cyc, members, domain, args.slr_mode, fhrs,
+                                 family=fam.key, manifest=manifest_name)
     own_executor = executor is None
     ex = executor or (None if prior and prior["complete"] else
                       cf.ProcessPoolExecutor(max_workers=args.workers, initializer=init_worker, initargs=(cfg,)))
@@ -167,7 +213,7 @@ def run(args, task_fn=None, executor=None) -> int:
     src_counts: dict[str, int] = {}
     total_bytes = 0
 
-    alive: set[str] = set(members)
+    alive: set[str] = set(units)
     dropped: dict[str, dict] = {}            # member -> {"from_fhr": ..., "why": ...}
     state = {f: {"res": {}, "err": {}, "failed": set()} for f in fhrs}
     futures: dict[cf.Future, tuple[int, str]] = {}
@@ -188,6 +234,7 @@ def run(args, task_fn=None, executor=None) -> int:
         log.info("reusing %d of %d hours already published for %s (no NOAA downloads for them)%s", head, len(fhrs), run_id,
                  "" if head < len(fhrs) else "; nothing left to fetch")
 
+    lookahead = args.lookahead if fam.units == "member" else max(args.lookahead, args.workers)   # one task is a whole hour
     first_miss: dict[tuple[int, str], float] = {}     # (hour, member) -> when the mirrors first said "not posted yet"
     origin_after = getattr(args, "origin_after_seconds", 120.0)
 
@@ -198,7 +245,7 @@ def run(args, task_fn=None, executor=None) -> int:
 
     def write_manifest(complete: bool):
         man = {
-            "version": 1, "model": "GEFS",
+            "version": 1, "model": fam.label, "family": fam.key, "levels": list(fam.levels), "credit": fam.credit,
             "generated": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "init": cyc.strftime("%Y-%m-%dT%H:%M:%SZ"), "run": run_id, "base": f"{run_id}/",
             "complete": complete, "members": members, "domain": domain.to_dict(),
@@ -213,15 +260,15 @@ def run(args, task_fn=None, executor=None) -> int:
             "sources_used": src_counts, "steps": steps,
         }
         out.mkdir(parents=True, exist_ok=True)
-        tmp = out / "latest.json.tmp"
+        tmp = out / (manifest_name + ".tmp")
         tmp.write_text(json.dumps(man, separators=(",", ":")))
-        os.replace(tmp, out / "latest.json")
+        os.replace(tmp, out / manifest_name)
 
     try:
         while head < len(fhrs):
-            while submitted < min(head + args.lookahead, len(fhrs) - 1):
+            while submitted < min(head + lookahead, len(fhrs) - 1):
                 submitted += 1
-                for m in members:
+                for m in units:
                     if m in alive:
                         submit(fhrs[submitted], m)
             now_t = time.time()
@@ -280,11 +327,11 @@ def run(args, task_fn=None, executor=None) -> int:
                             len(alive), len(members))
                 continue
             if act == "ready":
-                total_bytes += finalize_step(fhr, fhrs[head - 1] if head else 0, members, st["res"], acc,
+                total_bytes += finalize_step(fhr, fhrs[head - 1] if head else 0, members, flatten_results(st["res"]), acc,
                                              cum_x, run_dir, domain, steps, cyc, carry)
                 state[fhr] = {"res": {}, "err": {}, "failed": set()}
                 write_manifest(False)
-                log.info("f%03d done (%d/%d, %d members)  %.0fs elapsed", fhr, head + 1, len(fhrs), len(alive),
+                log.info("f%03d done (%d/%d, %d members)  %.0fs elapsed", fhr, head + 1, len(fhrs), steps[-1]["n"],
                          time.time() - t_start)
                 head += 1
                 blocked_since = None
@@ -361,12 +408,16 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", default="site/data")
     ap.add_argument("--cycle", default="auto", help="auto or YYYYMMDDHH")
-    ap.add_argument("--members", type=int, default=31)
+    ap.add_argument("--family", default="gefs", choices=sorted(families.FAMILIES), help="which ensemble to process")
+    ap.add_argument("--manifest", default="latest.json", help="manifest file name under --out")
+    ap.add_argument("--synoptic-too", action="store_true",
+                    help="GEFS only: make sure a 00Z/12Z cycle is also published (synoptic.json), because IFS and GEPS exist only for those")
+    ap.add_argument("--members", type=int, default=None, help="use only the first N members (testing)")
     ap.add_argument("--max-fhr", type=int, default=C.DEFAULT_MAX_FHR)
     ap.add_argument("--workers", type=int, default=int(os.environ.get("GEFS_WORKERS", 6)))
     ap.add_argument("--lookahead", type=int, default=2, help="forecast steps downloaded ahead of the writer")
     ap.add_argument("--wait-minutes", type=float, default=90.0, help="hard cap on waiting for not-yet-posted files at one forecast hour")
-    ap.add_argument("--min-members", type=int, default=20, help="keep publishing while at least this many members remain")
+    ap.add_argument("--min-members", type=int, default=None, help="keep publishing while at least this many members remain (default: per family)")
     ap.add_argument("--straggler-minutes", type=float, default=15.0,
                     help="once --min-members have arrived, drop members that are still missing this long after the last arrival")
     ap.add_argument("--poll-seconds", type=float, default=45.0)
@@ -383,7 +434,43 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
-    return run(args)
+    rc = run(args)
+    if args.synoptic_too and args.family == "gefs" and rc == 0 and getattr(args, "resolved_cycle", None) is not None:
+        rc = publish_synoptic(args)
+    return rc
+
+
+def synoptic_target(main: dt.datetime, now: dt.datetime | None = None, bases: dict | None = None) -> dt.datetime:
+    """The 00/12Z cycle GEFS should also publish for the blend: the newest one that IFS and GEPS both already have, so
+    the three models line up; the 00/12Z cycle at or before the main GEFS cycle when they cannot be reached."""
+    fallback = floor_cycle(main, 12)
+    now = now or dt.datetime.now(dt.timezone.utc)
+    try:
+        domain = C.Domain()
+        chains = [build_chain(families.get(k), build_gates(C.HOST_POLICIES, 1), (), bases, domain) for k in ("ifs", "geps")]
+        cyc = floor_cycle(now, 12)
+        for _ in range(4):
+            if cyc <= fallback and all(ch.exists(cyc.strftime("%Y%m%d"), cyc.strftime("%H"), 3) for ch in chains):
+                return cyc
+            cyc -= dt.timedelta(hours=12)
+    except Exception as e:  # noqa: BLE001 - the blend is optional; never let the probe stop the GEFS build
+        log.warning("could not check which IFS/GEPS cycles exist (%s); using %s", e, fallback.strftime("%Y%m%d%H"))
+    return fallback
+
+
+def publish_synoptic(args, target_fn=None) -> int:
+    """GEFS also runs at 06/18Z but IFS and GEPS do not: keep a 00/12Z cycle as synoptic.json for the blend."""
+    main = args.resolved_cycle
+    out = Path(args.out)
+    target = (target_fn or synoptic_target)(main)
+    if target == main:
+        shutil.copyfile(out / "latest.json", out / "synoptic.json")
+        return 0
+    args2 = argparse.Namespace(**vars(args))
+    args2.cycle = target.strftime("%Y%m%d%H")
+    args2.manifest = "synoptic.json"
+    log.info("GEFS %s is not the cycle IFS/GEPS have; also building %s for the multi-model blend", main.strftime("%Y%m%d%H"), args2.cycle)
+    return run(args2)
 
 
 if __name__ == "__main__":

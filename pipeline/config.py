@@ -100,7 +100,18 @@ HOST_POLICIES: dict[str, dict] = {
     "aws": {"rate": 80.0, "burst": 24, "concurrency": 32},
     "gcs": {"rate": 60.0, "burst": 20, "concurrency": 32},
     "nomads": {"rate": 1.5, "burst": 3, "concurrency": 2, "max_404_per_min": 8},
+    #  - ecmwf: data.ecmwf.int (ECMWF open data, the primary IFS source).  One request per field and member; the server
+    #    answers ~25-30 ranged reads a second, so we stay a little under that.
+    #  - ecmwf_aws: the AWS copy of the same files; it answers HTTP 503 "SlowDown" under load, so it is only a fallback.
+    #  - msc: dd.weather.gc.ca (Environment and Climate Change Canada datamart, GEPS); whole files, 21 members each.
+    "ecmwf": {"rate": 28.0, "burst": 16, "concurrency": 16, "max_404_per_min": 30},
+    "ecmwf_aws": {"rate": 10.0, "burst": 6, "concurrency": 6, "max_404_per_min": 30},
+    "msc": {"rate": 12.0, "burst": 8, "concurrency": 8, "max_404_per_min": 30},
 }
+
+ECMWF_BASE = "https://data.ecmwf.int/forecasts"
+ECMWF_AWS_BASE = "https://ecmwf-forecasts.s3.eu-central-1.amazonaws.com"
+MSC_BASE = "https://dd.weather.gc.ca"
 
 USER_AGENT = "gefs-winter-wx/1.0 (+https://github.com/{repo})".format(
     repo=os.environ.get("GITHUB_REPOSITORY", "local")

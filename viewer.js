@@ -1,14 +1,16 @@
-/* GEFS ensemble winter-weather viewer.
+/* Ensemble winter-weather viewer: NOAA GEFS, ECMWF IFS ENS, ECCC GEPS, and a blend of them.
  * Loads small gzipped binary files (cumulative QPF/snow per member, p-type probabilities per member),
  * derives any window total / ensemble statistic in the browser, and paints it with a WebGL layer.
+ * The blend is made here, not in the pipeline: the members of every model that shares the run time are pooled and
+ * (by default) weighted so that each model counts the same however many members it has.
  */
 'use strict';
 
 const $ = (s, el = document) => el.querySelector(s);
-const isMem = (s) => /^m\d+$/.test(s);
+const isMem = (s) => /^m\d+$/.test(s);                     // m<global member index>
 const MM_PER_IN = 25.4, CM_PER_IN = 2.54;
 const TIE_ORDER = [2, 3, 1, 0];            // FZRA > PL > SN > RA  (indices into RA, SN, FZRA, PL)
-const PERIODS = [['step', '3 hr'], [6, '6 hr'], [12, '12 hr'], [24, '24 hr'], [48, '48 hr']];
+const PERIODS = [['step', 'Step'], [6, '6 hr'], [12, '12 hr'], [24, '24 hr'], [48, '48 hr']];
 const PROB_THRESH = { qpf: [0.01, 0.10, 0.25, 0.50, 1.00, 2.00], snow: [1, 3, 6, 12, 18, 24],
   zr: [0.01, 0.05, 0.10, 0.25, 0.50, 1.00], pl: [0.01, 0.05, 0.10, 0.25, 0.50, 1.00] };   // inches
 /* Accumulation products: array key in the cumulative file, header scale slot, and SI unit. Snowfall is in cm; the rest are mm of liquid. */
@@ -30,8 +32,18 @@ const PROB_RAMP = {
 };
 const PROB_EDGES = [10, 20, 30, 40, 50, 60, 70, 80, 90];
 
+/* The models.  `color` marks a model's members in the tooltip's dot strip. */
+const FAMS = {
+  gefs: { label: 'GEFS', long: 'NOAA GEFS', color: '#4b5563' },
+  ifs: { label: 'IFS ENS', long: 'ECMWF IFS ENS', color: '#0f766e' },
+  geps: { label: 'GEPS', long: 'ECCC GEPS', color: '#7e22ce' },
+};
+const FAM_KEYS = ['gefs', 'ifs', 'geps'];
+const sig = () => `${S.fam}|${S.wmode}|${S.src.map((s) => s.key + s.man.init + s.man.generated).join(',')}`;     // identifies the pooled ensemble (cache key)
 const S = {
-  man: null, base: '', steps: [], byFhr: new Map(), idx: 0,
+  sets: {}, fam: 'blend', wmode: 'model', note: '',          // loaded manifests; selected model; blend weighting
+  src: [], all: [], off: {}, init: '', domain: null, gen: '', complete: true, products: null,
+  steps: [], byFhr: new Map(), idx: 0,
   product: 'qpf', period: 24, stat: 'mean', lpmmR: 4, slr: 'kuchera', hasSwe: false, opacity: 0.82,
   cur: null, token: 0, pin: null, playing: false, timer: null,
 };
@@ -64,7 +76,8 @@ async function fetchBin(url) {
     const dv = new DataView(buf);
     const h = { kind: dv.getUint8(4), narr: dv.getUint8(5) || 2, nmem: dv.getUint16(6, true), ny: dv.getUint16(8, true), nx: dv.getUint16(10, true),
       fhr: dv.getUint16(12, true), stepH: dv.getUint16(14, true), s0: dv.getFloat32(32, true), s1: dv.getFloat32(36, true),
-      s2: dv.getFloat32(40, true), s3: dv.getFloat32(44, true), mask: dv.getUint32(48, true), s4: dv.getFloat32(52, true) };      // mask 0 = legacy file, all members
+      s2: dv.getFloat32(40, true), s3: dv.getFloat32(44, true), s4: dv.getFloat32(52, true),
+      mask: dv.getUint32(48, true) + dv.getUint32(56, true) * 4294967296 };      // members 0-31 | members 32-63; 0 = legacy file, all members
     const n = h.nmem * h.ny * h.nx;
     if (h.kind === 1) {
       const o = { h }; ['q', 's', 'z', 'p', 'w'].slice(0, h.narr).forEach((k, i) => { o[k] = new Uint16Array(buf, 64 + 2 * n * i, n); });
@@ -73,8 +86,8 @@ async function fetchBin(url) {
     return { h, p: new Uint8Array(buf, 64, 4 * n) };
   });
 }
-const loadCum = (fhr) => fetchBin(S.base + S.byFhr.get(fhr).cum);
-const loadPtype = (fhr) => fetchBin(S.base + S.byFhr.get(fhr).ptype);
+const loadCum = (s, fhr) => fetchBin(s.base + s.byFhr.get(fhr).cum);
+const loadPtype = (s, fhr) => fetchBin(s.base + s.byFhr.get(fhr).ptype);
 
 /* ============================================================================= windows & statistics */
 function windowFor(i, period) {
@@ -84,23 +97,41 @@ function windowFor(i, period) {
   return { end, start, since, hours: end - start };
 }
 
-/** Member totals over the window, raw units (mm for QPF, cm for snow). Float32Array(M*N). */
-async function windowValues(kind, i, period, extraMask) {
+/** Member totals over the window, raw units (mm for QPF, cm for snow), pooled over the selected model(s). Float32Array(M*N).
+ *  `extra`: {source key: member bitmask} of members to leave out (e.g. those without p-type data).
+ *  `members` are global indices (S.all); `parts` says which rows came from which source; `weights` is null for equal weighting. */
+async function windowValues(kind, i, period, extra) {
   const w = windowFor(i, period), sc = src(kind), key = sc.key;
-  const [a, b] = await Promise.all([loadCum(w.end), w.start > 0 ? loadCum(w.start) : null]);
-  if (!a[key]) throw new Error(`${PRODUCTS[kind].name}${key === 'w' ? ' at a fixed ratio' : ''} is not in this run's files yet (the next pipeline run adds it)`);
-  // Members missing from either file (or from `extraMask`) are left out; everything downstream works on the compacted set.
-  const full = 2 ** a.h.nmem - 1, mk = (h) => h.mask || full;
-  let mask = mk(a.h); if (b) mask = Number(BigInt(mask) & BigInt(mk(b.h))); if (extraMask) mask = Number(BigInt(mask) & BigInt(extraMask));
-  const members = EnsStats.membersFromMask(mask, a.h.nmem);
-  if (!members.length) throw new Error('no ensemble member has data for this window');
-  const scale = a.h[sc.scale], N = a.h.ny * a.h.nx, out = new Float32Array(members.length * N), A = a[key];
-  members.forEach((m, j) => {
-    const o = m * N, d = j * N;
-    if (b) { const B = b[key]; for (let k = 0; k < N; k++) out[d + k] = Math.max(0, A[o + k] - B[o + k]) * scale; }
-    else for (let k = 0; k < N; k++) out[d + k] = A[o + k] * scale;
-  });
-  return { data: out, w, h: { ...a.h, nmem: members.length }, members };
+  const loaded = await Promise.all(S.src.map(async (s) => {
+    const [a, b] = await Promise.all([loadCum(s, w.end), w.start > 0 ? loadCum(s, w.start) : null]);
+    return { s, a, b };
+  }));
+  // Members missing from either file (or from `extra`) are left out; everything downstream works on the compacted set.
+  const parts = [];
+  for (const { s, a, b } of loaded) {
+    if (!a[key]) throw new Error(`${PRODUCTS[kind].name}${key === 'w' ? ' at a fixed ratio' : ''} is not in ${FAMS[s.key].label}'s files yet (the next pipeline run adds it)`);
+    const full = 2 ** a.h.nmem - 1, mk = (h) => h.mask || full;
+    let mask = mk(a.h); if (b) mask = Number(BigInt(mask) & BigInt(mk(b.h))); if (extra && extra[s.key]) mask = Number(BigInt(mask) & BigInt(extra[s.key]));
+    const ks = EnsStats.membersFromMask(mask, a.h.nmem);
+    if (ks.length) parts.push({ s, a, b, ks });
+  }
+  if (!parts.length) throw new Error('no ensemble member has data for this window');
+  const N = parts[0].a.h.ny * parts[0].a.h.nx, M = parts.reduce((t, p) => t + p.ks.length, 0), out = new Float32Array(M * N);
+  const members = [], weights = parts.length > 1 && S.wmode === 'model' ? new Float32Array(M) : null;
+  let j = 0;
+  for (const p of parts) {
+    const scale = p.a.h[sc.scale], A = p.a[key], B = p.b && p.b[key], j0 = j;
+    p.j0 = j0;
+    for (const k of p.ks) {
+      const o = k * N, d = j * N;
+      if (B) for (let q = 0; q < N; q++) out[d + q] = Math.max(0, A[o + q] - B[o + q]) * scale;
+      else for (let q = 0; q < N; q++) out[d + q] = A[o + q] * scale;
+      members.push(S.off[p.s.key] + k);
+      if (weights) weights[j] = 1 / (parts.length * p.ks.length);       // each model counts the same
+      j++;
+    }
+  }
+  return { data: out, w, h: { ...parts[0].a.h, nmem: M }, members, weights, parts: parts.map((p) => ({ s: p.s, ks: p.ks, j0: p.j0 })) };
 }
 
 const toDisp = (kind, v) => v / siPerIn(kind);   // raw (mm or cm) -> inches
@@ -110,16 +141,17 @@ const lpmmMi = () => Math.round((S.lpmmR * 34.5) / 10) * 10;   // radius in cell
 
 /** PMM / LPMM run in a Web Worker (falls back to the main thread). A newer request cancels an older one still running. */
 let worker = null, wJob = 0, wPending = null;
-function computeSlow(data, M, ny, nx, stat, radius) {
-  if (typeof Worker === 'undefined' || worker === false) return Promise.resolve(EnsStats.compute(data, M, ny, nx, stat, { radius }));
+function computeSlow(data, M, ny, nx, stat, radius, weights) {
+  const here = () => EnsStats.compute(data, M, ny, nx, stat, { radius, weights });
+  if (typeof Worker === 'undefined' || worker === false) return Promise.resolve(here());
   if (wPending) { wPending(null); wPending = null; worker.terminate(); worker = null; }      // drop the stale job
-  try { worker = worker || new Worker('statworker.js'); } catch (e) { worker = false; return Promise.resolve(EnsStats.compute(data, M, ny, nx, stat, { radius })); }
+  try { worker = worker || new Worker('statworker.js'); } catch (e) { worker = false; return Promise.resolve(here()); }
   const id = ++wJob, w = worker;
   return new Promise((resolve) => {
     wPending = resolve;
-    w.onmessage = (e) => { if (e.data.id !== id) return; wPending = null; resolve(e.data.error ? EnsStats.compute(data, M, ny, nx, stat, { radius }) : e.data.out); };
-    w.onerror = () => { wPending = null; worker = false; resolve(EnsStats.compute(data, M, ny, nx, stat, { radius })); };
-    w.postMessage({ id, data, M, ny, nx, stat, radius });
+    w.onmessage = (e) => { if (e.data.id !== id) return; wPending = null; resolve(e.data.error ? here() : e.data.out); };
+    w.onerror = () => { wPending = null; worker = false; resolve(here()); };
+    w.postMessage({ id, data, M, ny, nx, stat, radius, weights });
   });
 }
 const FIELD_MEMO = new Map();          // PMM / LPMM fields are the expensive ones: keep the last few
@@ -129,15 +161,16 @@ async function reduceStat(kind, win, stat) {
   const { nmem: M, ny, nx } = win.h, N = ny * nx, data = win.data, c = 1 / siPerIn(kind);
   if (isMem(stat) && win.members.includes(+stat.slice(1))) { const out = new Float32Array(N), o = win.members.indexOf(+stat.slice(1)) * N; for (let i = 0; i < N; i++) out[i] = data[o + i] * c; return out; }
   if (isMem(stat)) stat = 'mean';                   // that member has no data for this window
+  const wt = win.weights;
   if (stat.startsWith('prob:')) {
     const out = new Float32Array(N), thr = (+stat.slice(5)) / c;                 // inches -> raw
-    for (let i = 0; i < N; i++) { let k = 0; for (let m = 0; m < M; m++) if (data[m * N + i] >= thr) k++; out[i] = (100 * k) / M; }
+    for (let i = 0; i < N; i++) { let k = 0; for (let m = 0; m < M; m++) if (data[m * N + i] >= thr) k += wt ? wt[m] : 1; out[i] = wt ? 100 * k : (100 * k) / M; }
     return out;
   }
   const slow = stat === 'pmm' || stat === 'lpmm';
-  const key = slow ? [kind, S.man.init, win.w.start, win.w.end, stat, S.lpmmR, kind === 'snow' ? S.slr : ''].join('|') : null;
+  const key = slow ? [sig(), kind, win.w.start, win.w.end, stat, S.lpmmR, kind === 'snow' ? S.slr : ''].join('|') : null;
   if (key && FIELD_MEMO.has(key)) return FIELD_MEMO.get(key);
-  const out = slow ? await computeSlow(data, M, ny, nx, stat, S.lpmmR) : EnsStats.compute(data, M, ny, nx, stat, { radius: S.lpmmR });
+  const out = slow ? await computeSlow(data, M, ny, nx, stat, S.lpmmR, wt) : EnsStats.compute(data, M, ny, nx, stat, { radius: S.lpmmR, weights: wt });
   if (!out) return null;                              // superseded while computing
   for (let i = 0; i < N; i++) out[i] *= c;
   if (key) { FIELD_MEMO.set(key, out); while (FIELD_MEMO.size > 10) FIELD_MEMO.delete(FIELD_MEMO.keys().next().value); }
@@ -154,15 +187,20 @@ const dbzOf = (rate, type) => (rate <= 0 ? 0 : type === 1 ? 32.5 + 22.1 * Math.l
 
 async function ptypeData() {
   const st = S.steps[S.idx];
-  const pt = await loadPtype(st.fhr), qw = await windowValues('qpf', S.idx, 'step', pt.h.mask);
-  const M = qw.members.length, N = pt.h.ny * pt.h.nx, full = pt.h.nmem * N, p = new Uint8Array(4 * M * N);
-  for (let t = 0; t < 4; t++) qw.members.forEach((m, j) => p.set(pt.p.subarray(t * full + m * N, t * full + (m + 1) * N), t * M * N + j * N));
-  return { p, q: qw.data, h: { ...pt.h, nmem: M }, w: qw.w, members: qw.members };
+  const pts = await Promise.all(S.src.map((s) => loadPtype(s, st.fhr)));
+  const extra = {}; S.src.forEach((s, j) => { extra[s.key] = pts[j].h.mask; });
+  const qw = await windowValues('qpf', S.idx, 'step', extra);
+  const M = qw.h.nmem, N = qw.h.ny * qw.h.nx, p = new Uint8Array(4 * M * N);
+  for (const part of qw.parts) {
+    const pt = pts[S.src.indexOf(part.s)], full = pt.h.nmem * N;
+    part.ks.forEach((k, jj) => { for (let t = 0; t < 4; t++) p.set(pt.p.subarray(t * full + k * N, t * full + (k + 1) * N), t * M * N + (part.j0 + jj) * N); });
+  }
+  return { p, q: qw.data, h: { ...qw.h }, w: qw.w, members: qw.members, weights: qw.weights, parts: qw.parts };
 }
 
 function buildPtype(d, stat) {
   if (isMem(stat) && !d.members.includes(+stat.slice(1))) stat = 'ens';
-  const { p, q, h, w } = d, M = h.nmem, N = h.ny * h.nx, rateDiv = w.hours || 3;
+  const { p, q, h, w } = d, M = h.nmem, N = h.ny * h.nx, rateDiv = w.hours || 3, wt = d.weights, wm = (m) => (wt ? wt[m] : 1 / M);
   const field = new Float32Array(N), types = new Float32Array(N), tot = M * N;
   const share = (m, i, t) => { let s = 0; for (let k = 0; k < 4; k++) s += p[k * tot + m * N + i]; return s ? p[t * tot + m * N + i] / s : 0; };
   for (let i = 0; i < N; i++) {
@@ -171,13 +209,13 @@ function buildPtype(d, stat) {
       if (t >= 0) { field[i] = dbzOf(q[m * N + i] / rateDiv, t); types[i] = t; }
     } else if (stat.startsWith('prob:')) {
       const want = +stat.slice(5); let k = 0;
-      for (let m = 0; m < M; m++) if (domType(p, N, m, i) === want) k++;
-      field[i] = (100 * k) / M; types[i] = want;
+      for (let m = 0; m < M; m++) if (domType(p, N, m, i) === want) k += wm(m);
+      field[i] = 100 * k; types[i] = want;
     } else {                                              // 'ens': QPF-weighted dominant type, mean-QPF intensity
       const wsum = [0, 0, 0, 0]; let qs = 0;
-      for (let m = 0; m < M; m++) { const qq = q[m * N + i]; qs += qq; if (qq > 0) for (let t = 0; t < 4; t++) wsum[t] += qq * share(m, i, t); }
+      for (let m = 0; m < M; m++) { const qq = q[m * N + i] * wm(m); qs += qq; if (qq > 0) for (let t = 0; t < 4; t++) wsum[t] += qq * share(m, i, t); }
       let best = -1, bv = 0; for (const t of TIE_ORDER) if (wsum[t] > bv) { bv = wsum[t]; best = t; }
-      if (best >= 0) { field[i] = dbzOf(qs / M / rateDiv, best); types[i] = best; }
+      if (best >= 0) { field[i] = dbzOf(qs / rateDiv, best); types[i] = best; }
     }
   }
   return { field, types };
@@ -220,8 +258,8 @@ function prefetch() {
   if (S.idx !== lastIdx) dir = Math.sign(S.idx - lastIdx); lastIdx = S.idx;
   const gen = ++pfGen, nav = navigator.connection || {};
   if (nav.saveData || /(^|-)2g$/.test(nav.effectiveType || '')) return;
-  const urls = [], add = (fhr) => { if (fhr != null && S.byFhr.has(fhr)) urls.push(S.base + S.byFhr.get(fhr).cum); };
-  const addPt = (fhr) => { if (S.byFhr.has(fhr)) urls.push(S.base + S.byFhr.get(fhr).ptype); };
+  const urls = [], add = (fhr) => { if (fhr != null && S.byFhr.has(fhr)) S.src.forEach((s) => urls.push(s.base + s.byFhr.get(fhr).cum)); };
+  const addPt = (fhr) => { if (S.byFhr.has(fhr)) S.src.forEach((s) => urls.push(s.base + s.byFhr.get(fhr).ptype)); };
   const per = S.product === 'ptype' ? 'step' : S.period;
   [1, 2, 3, -1].map((d) => d * dir).forEach((d) => { const j = S.idx + d; if (j < 0 || j >= S.steps.length) return; const w = windowFor(j, per); add(w.end); if (w.start > 0) add(w.start); if (S.product === 'ptype') addPt(w.end); });
   const here = S.steps[S.idx];
@@ -241,7 +279,10 @@ function prefetch() {
 const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
 const fmtLocal = (d) => d.toLocaleString([], { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', timeZoneName: 'short' });
 const fmtUtc = (d) => `${d.toISOString().slice(5, 10).replace('-', '/')} ${d.toISOString().slice(11, 13)}Z`;
-const stepN = (i) => (S.steps[i].n ?? S.man.members.length);
+const stepN = (i) => (S.steps[i].n ?? S.all.length);
+const memLabel = (g) => { const m = S.all[g]; return m ? (S.src.length > 1 ? `${FAMS[m.fam].label} ${m.id}` : m.id) : `member ${g}`; };
+const initTxt = () => { const d = new Date(S.init); return `${d.toISOString().slice(0, 10)} ${d.toISOString().slice(11, 13)}Z`; };
+const famTitle = () => (S.fam === 'blend' ? `Blend of ${S.src.map((s) => FAMS[s.key].label).join(' + ')}` : FAMS[S.fam].long);
 const pad = (n, w = 3) => String(n).padStart(w, '0');
 
 function productName() {
@@ -256,30 +297,36 @@ function statName() {
   if (s === 'pmm') return 'Probability-matched mean (PMM)';
   if (s === 'lpmm') return `Local prob.-matched mean (LPMM \u00b1${lpmmMi()} mi)`;
   if (EnsStats.isPct(s)) return s === 'p50' ? '50th percentile (median)' : `${s.slice(1)}th percentile`;
-  if (s === 'ens') return 'Most likely type (ensemble)';
+  if (s === 'ens') return S.src.length > 1 ? 'Most likely type (blend)' : 'Most likely type (ensemble)';
   if (s.startsWith('prob:')) {
     const v = +s.slice(5);
     return S.product === 'ptype' ? `Probability of ${PTYPE.long[v].toLowerCase()}` : `Probability ≥ ${v}″`;
   }
-  const m = +s.slice(1); return m === 0 ? 'Control (c00)' : `Member p${pad(m, 2)}`;
+  const g = +s.slice(1), m = S.all[g];
+  return m && m.id === 'c00' ? `Control (${memLabel(g)})` : `Member ${memLabel(g)}`;
 }
 
 function updateWarn() {
-  const st = S.steps[S.idx], tot = S.man.members.length, el = $('#t-warn');
-  if (st.n === undefined || st.n >= tot) { el.hidden = true; return; }
-  const gone = S.man.members.filter((m, k) => st.mask && !(Math.floor(st.mask / 2 ** k) % 2)).join(', ');
-  el.hidden = false; el.textContent = `\u26a0 ${st.n} of ${tot} members at this hour (missing: ${gone}). Statistics use the members that are available.`;
+  const st = S.steps[S.idx], el = $('#t-warn'), bits = [];
+  S.src.forEach((s) => {
+    const part = st.parts[s.key], tot = s.man.members.length;
+    if (!part || part.n === undefined || part.n >= tot) return;
+    const gone = s.man.members.filter((m, k) => part.mask && !(Math.floor(part.mask / 2 ** k) % 2)).join(', ');
+    bits.push(`${S.src.length > 1 ? FAMS[s.key].label + ': ' : ''}${part.n} of ${tot} members (missing: ${gone})`);
+  });
+  if (!bits.length) { el.hidden = true; return; }
+  el.hidden = false; el.textContent = `\u26a0 ${bits.join('; ')} at this hour. Statistics use the members that are available.`;
 }
 
 function updateTitle() {
-  const st = S.steps[S.idx], valid = new Date(st.valid), init = new Date(S.man.init);
+  const st = S.steps[S.idx], valid = new Date(st.valid), init = new Date(S.init);
   const w = windowFor(S.idx, S.product === 'ptype' ? 'step' : S.period);
   const startD = new Date(init.getTime() + w.start * 3600e3);
   $('#t-main').textContent = `${statName()} · ${productName()}`;
   $('#t-valid').textContent = S.product === 'ptype' || w.hours <= st.step_h
     ? `Valid ${fmtLocal(valid)} (${fmtUtc(valid)})`
     : `${fmtLocal(startD)} → ${fmtLocal(valid)}`;
-  $('#t-init').textContent = `GEFS ${init.toISOString().slice(0, 10)} ${init.toISOString().slice(11, 13)}Z run · F${pad(st.fhr)} · ${stepN(S.idx)} members`;
+  $('#t-init').textContent = `${famTitle()} · ${initTxt()} run · F${pad(st.fhr)} · ${stepN(S.idx)} members${S.src.length > 1 ? (S.wmode === 'model' ? ' · models weighted equally' : ' · members weighted equally') : ''}`;
   updateWarn();
   $('#fh').textContent = `F${pad(st.fhr)}`;
   $('#fh-time').textContent = `${fmtLocal(valid)}`;
@@ -292,7 +339,7 @@ function updateLegend() {
   const el = $('#legend-body'); el.innerHTML = '';
   const hdr = $('#legend-title');
   if (S.product === 'ptype' && !isProb(S.stat)) {
-    hdr.textContent = 'Type color ramps — 3-hr QPF as dBZ';
+    hdr.textContent = 'Type color ramps — step QPF as dBZ';
     PTYPE.names.forEach((n, t) => {
       const row = document.createElement('div'); row.className = 'pt-row';
       row.innerHTML = `<span class="pt-name">${PTYPE.long[t]}</span>`;
@@ -304,10 +351,10 @@ function updateLegend() {
     [10, 20, 30, 40, 50, 60, 70].forEach((v) => { const s = document.createElement('span'); s.textContent = v; s.style.left = `${((v - 8) / 66) * 100}%`; ticks.appendChild(s); });
     el.appendChild(ticks);
     const note = document.createElement('div'); note.className = 'legend-note';
-    note.textContent = 'dBZ ≈ rate from 3-hr QPF (rain/ice: Z=200R^1.6, snow: Z=1780R^2.21)'; el.appendChild(note); return;
+    note.textContent = 'dBZ ≈ rate from step QPF (rain/ice: Z=200R^1.6, snow: Z=1780R^2.21)'; el.appendChild(note); return;
   }
   const c = classesFor();
-  hdr.textContent = c.prob ? `Probability (% of ${stepN(S.idx)} members)` :
+  hdr.textContent = c.prob ? `Probability (% of ${stepN(S.idx)} members${S.src.length > 1 && S.wmode === 'model' ? ', models weighted equally' : ''})` :
     `${c.title} (in)`;
   for (let i = c.colors.length - 1; i >= 0; i--) {
     const row = document.createElement('div'); row.className = 'lg-row';
@@ -323,7 +370,7 @@ const recentTouch = () => Date.now() - touchAt < 1200;   // ignore emulated mous
 let lastLL = null, raf = 0;
 
 function cellValues(lngLat, data, M, N, h) {
-  const d = S.man.domain, gx = (lngLat.lng - d.lon_west) / d.dlon, gy = (d.lat_north - lngLat.lat) / d.dlat;
+  const d = S.domain, gx = (lngLat.lng - d.lon_west) / d.dlon, gy = (d.lat_north - lngLat.lat) / d.dlat;
   if (gx < 0 || gy < 0 || gx > d.nx - 1 || gy > d.ny - 1) return null;
   const x0 = Math.min(Math.floor(gx), d.nx - 2), y0 = Math.min(Math.floor(gy), d.ny - 2), fx = gx - x0, fy = gy - y0;
   const i00 = y0 * d.nx + x0, w = [(1 - fx) * (1 - fy), fx * (1 - fy), (1 - fx) * fy, fx * fy], off = [0, 1, d.nx, d.nx + 1];
@@ -343,16 +390,25 @@ function placeName(pt) {
 /* Display precision: snowfall to tenths of an inch; QPF, freezing rain and sleet (liquid) to hundredths. */
 const fmtVal = (kind, inches) => `${inches.toFixed(kind === 'snow' ? 1 : 2)}″`;
 
-function stripSVG(vals, mean, med, kind, selected) {
-  const W = 268, H = 40, pad = 6, n = vals.length, mx = Math.max(...vals, 1e-9) * 1.04;
-  const sx = (v) => pad + (v / mx) * (W - 2 * pad), bins = new Map(), dots = [];
-  vals.forEach((v, m) => { const b = Math.round(sx(v) / 5); const k = bins.get(b) || 0; bins.set(b, k + 1); dots.push([sx(v), H - 8 - k * 5.2, m]); });
+function stripSVG(vals, mean, med, kind, selected, famOf) {
+  const W = 268, H = S.src.length > 1 ? 52 : 40, pad = 6, n = vals.length, mx = Math.max(...vals, 1e-9) * 1.04;
+  const sx = (v) => pad + (v / mx) * (W - 2 * pad), bins = new Map(), dots = [], step = n > 60 ? 4.4 : 5.2;
+  vals.forEach((v, m) => { const b = Math.round(sx(v) / 5); const k = bins.get(b) || 0; bins.set(b, k + 1); dots.push([sx(v), H - 8 - k * step, m]); });
   let s = `<svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="Ensemble member values">`;
   s += `<line x1="${pad}" x2="${W - pad}" y1="${H - 3}" y2="${H - 3}" stroke="#9aa3ab" stroke-width="1"/>`;
-  dots.forEach(([x, y, m]) => { s += `<circle cx="${x.toFixed(1)}" cy="${Math.max(4, y).toFixed(1)}" r="2.3" fill="${m === selected ? '#111' : '#5b6670'}" ${m === selected ? 'stroke="#fff" stroke-width="1"' : ''}/>`; });
+  dots.forEach(([x, y, m]) => { s += `<circle cx="${x.toFixed(1)}" cy="${Math.max(4, y).toFixed(1)}" r="2.3" fill="${m === selected ? '#111' : famOf ? FAMS[famOf[m]].color : '#5b6670'}" ${m === selected ? 'stroke="#fff" stroke-width="1"' : ''}/>`; });
   s += `<line x1="${sx(mean)}" x2="${sx(mean)}" y1="2" y2="${H - 3}" stroke="#c2410c" stroke-width="1.5"/>`;
   s += `<line x1="${sx(med)}" x2="${sx(med)}" y1="2" y2="${H - 3}" stroke="#1d4ed8" stroke-width="1.5" stroke-dasharray="2 2"/>`;
   return s + '</svg>';
+}
+
+/** Model of every pooled member (`members` are global indices) and a one-line "GEFS 0.52″ · IFS ..." summary of per-model means. */
+function famInfo(members, vals, kind) {
+  const famOf = members.map((g) => S.all[g].fam);
+  if (S.src.length < 2) return { famOf: null, line: '' };
+  const acc = {}; famOf.forEach((f, j) => { const a = acc[f] || (acc[f] = [0, 0]); a[0] += vals[j]; a[1]++; });
+  const line = S.src.map((s) => acc[s.key] ? `<span><i class="sw" style="background:${FAMS[s.key].color}"></i>${FAMS[s.key].label} <b>${fmtVal(kind, acc[s.key][0] / acc[s.key][1])}</b> <small>(${acc[s.key][1]})</small></span>` : '').join('');
+  return { famOf, line: `<div class="tip-fam">${line}</div>` };
 }
 
 function tipHTML(ll, pt) {
@@ -362,15 +418,17 @@ function tipHTML(ll, pt) {
     <small>${Math.abs(ll.lat).toFixed(2)}°${ll.lat >= 0 ? 'N' : 'S'}, ${Math.abs(ll.lng).toFixed(2)}°${ll.lng >= 0 ? 'E' : 'W'}</small></div>`;
   if (cur.kind === 'ptype') return head + ptypeTip(ll, cur.d);
   const { win } = cur, M = win.h.nmem, N = win.h.ny * win.h.nx, cell = cellValues(ll, win.data, M, N, win.h);
-  if (!cell) return head + '<div class="tip-b muted">Outside the GEFS domain.</div>';
+  if (!cell) return head + '<div class="tip-b muted">Outside the domain.</div>';
+  const wt = win.weights, wsum = wt ? Array.from(wt).reduce((a, b) => a + b, 0) : M;
   const vals = Array.from(cell.v, (x) => toDisp(S.product, x)), sorted = Float32Array.from(vals).sort();
-  const mean = vals.reduce((a, b) => a + b, 0) / M, med = pct(sorted, M, 0.5);
+  const mean = wt ? vals.reduce((a, b, m) => a + b * wt[m], 0) / wsum : vals.reduce((a, b) => a + b, 0) / M;
+  const wp = (p) => (wt ? EnsStats.wPercentile(vals, wt, p) : pct(sorted, M, p)), med = wp(0.5);
   const kind = S.product, f = (x) => fmtVal(kind, x);
-  const sel = isMem(S.stat) ? +S.stat.slice(1) : -1;
+  const sel = isMem(S.stat) ? win.members.indexOf(+S.stat.slice(1)) : -1;
   const val = { min: sorted[0], max: sorted[M - 1], mean };
-  EnsStats.PCTS.forEach((p) => { val[`p${p}`] = pct(sorted, M, p / 100); });
+  EnsStats.PCTS.forEach((p) => { val[`p${p}`] = wp(p / 100); });
   const nm2 = (k) => (k === 'mean' ? 'Mean' : k === 'min' ? 'Min' : k === 'max' ? 'Max' : k.toUpperCase());
-  const ord = EnsStats.TIP_ORDER, half = ord.length / 2;
+  const ord = EnsStats.TIP_ORDER, half = ord.length / 2, fi = famInfo(win.members, vals, kind);
   let h = head + `<div class="tip-t">${productName()} \u00b7 ${$('#t-valid').textContent}</div>`;
   if ((S.stat === 'pmm' || S.stat === 'lpmm') && cur.field) {
     const fv = cellValues(ll, cur.field, 1, N, win.h);
@@ -378,32 +436,38 @@ function tipHTML(ll, pt) {
   }
   h += '<div class="tip-grid">';
   for (let r = 0; r < half; r++) h += `<span>${nm2(ord[r])}</span><b>${f(val[ord[r]])}</b><span>${nm2(ord[r + half])}</span><b>${f(val[ord[r + half]])}</b>`;
-  h += '</div><div class="tip-s">Chance of at least</div><div class="tip-p">';
+  h += `</div>${fi.line}<div class="tip-s">Chance of at least</div><div class="tip-p">`;
   PROB_THRESH[kind].forEach((t) => {
-    const p = Math.round((100 * vals.filter((v) => v >= t).length) / M);
+    let k = 0; vals.forEach((v, m) => { if (v >= t) k += wt ? wt[m] : 1; });
+    const p = Math.round((100 * k) / wsum);
     h += `<span>${t}″</span><i><u style="width:${p}%"></u></i><b>${p}%</b>`;
   });
-  h += `</div><div class="tip-s">All ${M} members <span class="key"><i class="k1"></i>mean <i class="k2"></i>median</span></div>${stripSVG(vals, mean, med, kind, sel)}`;
+  h += `</div><div class="tip-s">All ${M} members <span class="key"><i class="k1"></i>mean <i class="k2"></i>median</span></div>${stripSVG(vals, mean, med, kind, sel, fi.famOf)}`;
   h += `<div class="tip-ax"><span>0</span><span>${f(Math.max(...vals))}</span></div>`;
   return h;
 }
 
 function ptypeTip(ll, d) {
-  const { p, q, h } = d, M = h.nmem, N = h.ny * h.nx, c = cellValues(ll, q, M, N, h);
-  if (!c) return '<div class="tip-b muted">Outside the GEFS domain.</div>';
-  const i = c.nearest, cnt = [0, 0, 0, 0], avg = [0, 0, 0, 0]; let wet = 0, qs = 0;
+  const { p, q, h } = d, M = h.nmem, N = h.ny * h.nx, c = cellValues(ll, q, M, N, h), wt = d.weights, wm = (m) => (wt ? wt[m] : 1 / M);
+  if (!c) return '<div class="tip-b muted">Outside the domain.</div>';
+  const i = c.nearest, cnt = [0, 0, 0, 0], pr = [0, 0, 0, 0], avg = [0, 0, 0, 0]; let wet = 0, qs = 0, wetW = 0;
   for (let m = 0; m < M; m++) {
-    const t = domType(p, N, m, i); if (t < 0) continue; cnt[t]++; wet++;
-    for (let k = 0; k < 4; k++) avg[k] += p[k * M * N + m * N + i];
+    qs += c.v[m] * wm(m);
+    const t = domType(p, N, m, i); if (t < 0) continue; cnt[t]++; pr[t] += wm(m); wet++; wetW += wm(m);
+    for (let k = 0; k < 4; k++) avg[k] += wm(m) * p[k * M * N + m * N + i];
   }
-  for (let m = 0; m < M; m++) qs += c.v[m];
-  const qm = qs / M, order = [1, 0, 2, 3];
+  const order = [1, 0, 2, 3], pc = (x) => Math.round(100 * x);
   let h2 = `<div class="tip-t">Precip type · ${$('#t-valid').textContent}</div>`;
-  h2 += `<div class="tip-grid"><span>Members with precip</span><b>${wet} / ${M}</b><span>Mean 3-hr QPF</span><b>${fmtVal('qpf', qm / MM_PER_IN)}</b></div>`;
-  h2 += '<div class="tip-s">Dominant type (members)</div><div class="tip-p">';
-  order.forEach((t) => { h2 += `<span><i class="sw" style="background:${PTYPE.ramps[PTYPE.names[t]][18]}"></i>${PTYPE.long[t]}</span><i><u style="width:${(100 * cnt[t]) / M}%"></u></i><b>${cnt[t]}</b>`; });
-  h2 += '</div><div class="tip-s">Mean Bourgouin probability (wet members)</div><div class="tip-grid">';
-  order.forEach((t) => { h2 += `<span>${PTYPE.long[t]}</span><b>${wet ? Math.round(avg[t] / wet) : 0}%</b>`; });
+  h2 += `<div class="tip-grid"><span>Members with precip</span><b>${wet} / ${M}</b><span>Mean ${d.w.hours}-hr QPF</span><b>${fmtVal('qpf', qs / MM_PER_IN)}</b></div>`;
+  h2 += `<div class="tip-s">Dominant type (${wt ? 'members \u00b7 share of the weighted ensemble' : 'members'})</div><div class="tip-p">`;
+  order.forEach((t) => { h2 += `<span><i class="sw" style="background:${PTYPE.ramps[PTYPE.names[t]][18]}"></i>${PTYPE.long[t]}</span><i><u style="width:${wt ? pc(pr[t]) : (100 * cnt[t]) / M}%"></u></i><b>${wt ? `${cnt[t]} \u00b7 ${pc(pr[t])}%` : cnt[t]}</b>`; });
+  h2 += '</div>';
+  if (S.src.length > 1) {
+    const by = S.src.map((s) => { const part = d.parts.find((x) => x.s === s); if (!part) return ''; let n = 0; part.ks.forEach((k, jj) => { if (domType(p, N, part.j0 + jj, i) >= 0) n++; }); return `<span><i class="sw" style="background:${FAMS[s.key].color}"></i>${FAMS[s.key].label} <b>${n}</b>/${part.ks.length} wet</span>`; }).join('');
+    h2 += `<div class="tip-fam">${by}</div>`;
+  }
+  h2 += '<div class="tip-s">Mean Bourgouin probability (wet members)</div><div class="tip-grid">';
+  order.forEach((t) => { h2 += `<span>${PTYPE.long[t]}</span><b>${wetW ? Math.round(avg[t] / wetW) : 0}%</b>`; });
   return h2 + '</div>';
 }
 
@@ -436,23 +500,80 @@ function pin(e) {
 }
 function unpin() { S.pin = null; tip().classList.remove('show', 'pinned'); if (pinMarker) pinMarker.remove(); }
 
+/* ============================================================================= models, sources and steps */
+const hhZ = (iso) => `${iso.slice(5, 10).replace('-', '/')} ${iso.slice(11, 13)}Z`;
+function makeSource(key, man) {
+  const byFhr = new Map(); man.steps.forEach((st) => byFhr.set(st.fhr, st));
+  return { key, man, base: `data/${key}/${man.base}`, byFhr, steps: man.steps };
+}
+const loadedFams = () => FAM_KEYS.filter((k) => S.sets[k] && S.sets[k].latest && S.sets[k].latest.steps.length);
+
+/** Which model(s) feed a selection.  The blend takes the run time shared by the most models (newest on a tie): IFS and GEPS
+ *  exist only at 00/12Z, so GEFS contributes its 00/12Z cycle (synoptic.json) and a model still on an older run is left out. */
+function pickSources(fam) {
+  if (fam !== 'blend') { const m = S.sets[fam] && S.sets[fam].latest; return { src: m && m.steps.length ? [makeSource(fam, m)] : [], note: '' }; }
+  const cand = FAM_KEYS.map((k) => { const x = S.sets[k]; const m = x && (k === 'gefs' ? (x.syn || x.latest) : x.latest); return m && m.steps.length ? { k, m } : null; }).filter(Boolean);
+  const groups = new Map(); cand.forEach((c) => groups.set(c.m.init, [...(groups.get(c.m.init) || []), c]));
+  let best = null; groups.forEach((g, init) => { if (!best || g.length > best.g.length || (g.length === best.g.length && init > best.init)) best = { init, g }; });
+  if (!best || best.g.length < 2) return { src: [], note: 'The blend needs at least two models with the same run time.' };
+  const left = cand.filter((c) => !best.g.includes(c)).map((c) => `${FAMS[c.k].label} is still on its ${hhZ(c.m.init)} run`);
+  return { src: best.g.map((c) => makeSource(c.k, c.m)), note: left.length ? `Not in the blend yet: ${left.join('; ')}.` : '' };
+}
+
+function applySources(src) {
+  S.src = src; S.all = []; S.off = {};
+  src.forEach((s) => { S.off[s.key] = S.all.length; s.man.members.forEach((id) => S.all.push({ fam: s.key, id })); });
+  S.init = src[0].man.init; S.domain = src[0].man.domain;
+  S.complete = src.every((s) => s.man.complete);
+  S.gen = src.map((s) => s.man.generated).sort().pop();
+  const sets = src.map((s) => new Set(s.man.products || ['qpf', 'snow', 'ptype']));
+  S.products = [...sets[0]].filter((p) => sets.every((x) => x.has(p)));
+  S.hasSwe = src.every((s) => !!(s.man.scales && s.man.scales.swe_mm_per_count));
+  if (src.length === 1) S.steps = src[0].steps.map((st) => ({ ...st, parts: { [src[0].key]: st } }));
+  else {                                          // hours every selected model has; a step spans back to the previous shared hour
+    const common = src[0].steps.map((st) => st.fhr).filter((f) => src.every((s) => s.byFhr.has(f)));
+    S.steps = common.map((f, i) => {
+      const parts = {}; src.forEach((s) => { parts[s.key] = s.byFhr.get(f); });
+      return { fhr: f, step_h: f - (i ? common[i - 1] : 0), valid: parts[src[0].key].valid, parts,
+        n: src.reduce((t, s) => t + (parts[s.key].n ?? s.man.members.length), 0) };
+    });
+  }
+  S.byFhr = new Map(S.steps.map((st) => [st.fhr, st]));
+}
+const nearestIdx = (fhr) => { let best = S.steps.length - 1, d = Infinity; S.steps.forEach((s, i) => { const x = Math.abs(s.fhr - fhr); if (x < d) { d = x; best = i; } }); return best; };
+
+/** Switch the selected model: returns false (and says why) when it has no data yet. */
+function setFamily(fam, quiet) {
+  const pick = pickSources(fam);
+  if (!pick.src.length) { if (!quiet) toast(pick.note || 'No data for that model yet'); return false; }
+  const fhr = S.steps.length ? S.steps[S.idx].fhr : 24;
+  S.fam = fam; S.note = pick.note; applySources(pick.src);
+  S.idx = nearestIdx(fhr);
+  if (!S.products.includes(S.product)) S.product = 'qpf';
+  if (!S.hasSwe) S.slr = 'kuchera';
+  FIELD_MEMO.clear(); S.cur = null;
+  return true;
+}
+
 /* ============================================================================= UI wiring */
 function toast(msg) { const t = $('#toast'); t.textContent = msg; t.hidden = false; setTimeout(() => (t.hidden = true), 6000); }
 
 function statOptions() {
-  const M = S.man.members, opts = [];
+  const opts = [];
   const g = (label, items) => opts.push(`<optgroup label="${label}">${items.map(([v, t]) => `<option value="${v}">${t}</option>`).join('')}</optgroup>`);
   if (S.product === 'ptype') {
     g('Ensemble', [['ens', 'Most likely type (QPF-weighted)']]);
-    g('Probability of type', PTYPE.names.map((n, t) => [`prob:${t}`, `${PTYPE.long[t]} (% of members)`]));
+    g('Probability of type', PTYPE.names.map((n, t) => [`prob:${t}`, `${PTYPE.long[t]} (% of ${S.src.length > 1 && S.wmode === 'model' ? 'weighted ' : ''}members)`]));
   } else {
     g('Ensemble statistics', [['min', 'Minimum'], ['p5', '5th percentile'], ['p10', '10th percentile'], ['p25', '25th percentile'], ['p50', '50th percentile (median)'],
       ['mean', 'Mean'], ['p75', '75th percentile'], ['p90', '90th percentile'], ['p95', '95th percentile'], ['max', 'Maximum']]);
     g('Probability-matched mean', [['pmm', 'PMM (whole map)'], ['lpmm', 'LPMM (local neighborhood)']]);
     g('Probability of at least', PROB_THRESH[S.product].map((t) => [`prob:${t}`, `${t}″`]));
   }
-  const here = EnsStats.membersFromMask(S.steps[S.idx].mask, M.length);
-  g('Single member', here.map((k) => [`m${k}`, k === 0 ? 'Control (c00)' : `Member ${M[k]}`]));
+  S.src.forEach((s) => {
+    const here = EnsStats.membersFromMask(S.steps[S.idx].parts[s.key].mask, s.man.members.length);
+    g(S.src.length > 1 ? `Single member \u2014 ${FAMS[s.key].label}` : 'Single member', here.map((k) => [`m${S.off[s.key] + k}`, s.man.members[k] === 'c00' ? 'Control (c00)' : `Member ${s.man.members[k]}`]));
+  });
   return opts.join('');
 }
 
@@ -463,18 +584,38 @@ function syncControls() {
   $('#stat').value = S.stat;
   $('#lpmm-wrap').hidden = S.stat !== 'lpmm'; $('#lpmm-r').value = String(S.lpmmR);
   $('#slr-wrap').hidden = !(S.product === 'snow' && S.hasSwe); $('#slr').value = S.slr;
+  document.querySelectorAll('#fam button').forEach((b) => b.classList.toggle('on', b.dataset.v === S.fam));
+  $('#wmode-wrap').hidden = S.src.length < 2; $('#wmode').value = S.wmode;
+  $('#wmode-help').textContent = S.wmode === 'model' ? 'Each model carries the same total weight, however many members it has.' : 'Every member counts the same, so a model with more members counts more.';
+  $('#fam-note').innerHTML = S.src.map((s) => `<span><i class="sw" style="background:${FAMS[s.key].color}"></i>${FAMS[s.key].long} ${hhZ(s.man.init)} \u00b7 ${s.man.members.length} members</span>`).join('') + (S.note ? `<em>${S.note}</em>` : '');
+  renderProducts();
   const help = { pmm: 'Ensemble-mean pattern with amplitudes re-assigned from all members pooled over the whole map, so peaks are not smoothed away.',
     lpmm: `Same matching done separately inside a \u00b1${lpmmMi()}-mile neighborhood around each point: keeps local detail and avoids mixing different weather regimes.` }[S.stat];
   $('#stat-help').textContent = help || ''; $('#stat-help').hidden = !help;
   document.querySelectorAll('#product button').forEach((b) => b.classList.toggle('on', b.dataset.v === S.product));
   document.querySelectorAll('#period button').forEach((b) => { b.classList.toggle('on', String(b.dataset.v) === String(S.period)); b.disabled = S.product === 'ptype' && b.dataset.v !== 'step'; });
   $('#period-note').hidden = S.product !== 'ptype';
-  location.hash = `p=${S.product}&per=${S.period}&s=${S.stat}${S.stat === 'lpmm' ? `&r=${S.lpmmR}` : ''}${S.product === 'snow' && S.hasSwe && S.slr !== 'kuchera' ? `&slr=${S.slr}` : ''}&f=${S.steps[S.idx].fhr}`;
+  location.hash = `m=${S.fam}${S.src.length > 1 && S.wmode !== 'model' ? `&w=${S.wmode}` : ''}&p=${S.product}&per=${S.period}&s=${S.stat}${S.stat === 'lpmm' ? `&r=${S.lpmmR}` : ''}${S.product === 'snow' && S.hasSwe && S.slr !== 'kuchera' ? `&slr=${S.slr}` : ''}&f=${S.steps[S.idx].fhr}`;
+}
+
+function renderProducts() {
+  const have = new Set(S.products), el = $('#product'), html = [['qpf', 'QPF'], ['snow', 'Snowfall'], ['zr', 'Freezing rain'], ['pl', 'Sleet'], ['ptype', 'Precip type']].filter(([v]) => have.has(v)).map(([v, t]) => `<button data-v="${v}">${t}</button>`).join('');
+  if (el.dataset.have !== html) { el.innerHTML = html; el.dataset.have = html; }
+}
+
+/** Day labels under the slider (they depend on which hours the selected model(s) have). */
+function buildDays() {
+  const days = $('#days'); days.innerHTML = ''; let prev = '';
+  const every = innerWidth < 760 && S.steps.length > 40 ? 2 : 1; let nd = 0;
+  S.steps.forEach((s, i) => { const d = new Date(s.valid), key = d.toDateString(); if (key !== prev) { prev = key; if (nd++ % every) return; const sp = document.createElement('span'); sp.textContent = d.toLocaleDateString([], { weekday: 'short', day: 'numeric' }); const fx = i / (S.steps.length - 1); sp.style.left = `${fx * 100}%`; if (fx > 0.93) sp.style.transform = 'translateX(-100%)'; days.appendChild(sp); } });
+  $('#slider').max = S.steps.length - 1;
 }
 
 function buildUI() {
-  const have = new Set(S.man.products || ['qpf', 'snow', 'ptype']);
-  $('#product').innerHTML = [['qpf', 'QPF'], ['snow', 'Snowfall'], ['zr', 'Freezing rain'], ['pl', 'Sleet'], ['ptype', 'Precip type']].filter(([v]) => have.has(v)).map(([v, t]) => `<button data-v="${v}">${t}</button>`).join('');
+  const famBtn = [...(pickSources('blend').src.length ? [['blend', 'Blend']] : []), ...loadedFams().map((k) => [k, FAMS[k].label])];
+  $('#fam').innerHTML = famBtn.map(([v, t]) => `<button data-v="${v}">${t}</button>`).join('');
+  $('#fam').onclick = (e) => { const b = e.target.closest('button'); if (!b || b.dataset.v === S.fam) return; if (setFamily(b.dataset.v)) { buildDays(); syncControls(); refresh(); } };
+  $('#wmode').onchange = (e) => { S.wmode = e.target.value; FIELD_MEMO.clear(); syncControls(); refresh(); };
   $('#period').innerHTML = PERIODS.map(([v, t]) => `<button data-v="${v}">${t}</button>`).join('');
   $('#product').onclick = (e) => { const b = e.target.closest('button'); if (!b) return; S.product = b.dataset.v; if (S.product === 'ptype') S.period = 'step'; else if (S.period === 'step') S.period = 24; syncControls(); refresh(); };
   $('#period').onclick = (e) => { const b = e.target.closest('button'); if (!b || b.disabled) return; S.period = b.dataset.v === 'step' ? 'step' : +b.dataset.v; syncControls(); refresh(); };
@@ -491,7 +632,7 @@ function buildUI() {
     const v = { ne: [[-74.5, 41], [-66.5, 47.8]], conus: [[-125.5, 24], [-66, 50]], na: [[-135, 20], [-52, 58]], se: [[-92, 24.5], [-75, 37.5]], mw: [[-98, 36], [-80, 49]] }[b.dataset.v];
     map.fitBounds(v, { padding: 20, duration: 600 });
   };
-  const sl = $('#slider'); sl.max = S.steps.length - 1;
+  const sl = $('#slider');
   sl.oninput = () => { S.idx = +sl.value; syncControls(); refresh(); };
   $('#prev').onclick = () => step(-1); $('#next').onclick = () => step(1);
   $('#play').onclick = togglePlay;
@@ -499,10 +640,7 @@ function buildUI() {
   $('#menu').onclick = () => $('#panel').classList.toggle('open');
   if (innerWidth > 760) document.body.classList.add('panel-open');
   $('#legend-toggle').onclick = () => $('#legend').classList.toggle('min');
-  // day labels under slider
-  const days = $('#days'); days.innerHTML = ''; let prev = '';
-  const every = innerWidth < 760 && S.steps.length > 40 ? 2 : 1; let nd = 0;
-  S.steps.forEach((s, i) => { const d = new Date(s.valid), key = d.toDateString(); if (key !== prev) { prev = key; if (nd++ % every) return; const sp = document.createElement('span'); sp.textContent = d.toLocaleDateString([], { weekday: 'short', day: 'numeric' }); const fx = i / (S.steps.length - 1); sp.style.left = `${fx * 100}%`; if (fx > 0.93) sp.style.transform = 'translateX(-100%)'; days.appendChild(sp); } });
+  buildDays();
 }
 function step(d) { const j = Math.max(0, Math.min(S.steps.length - 1, S.idx + d)); if (j === S.idx) { if (S.playing) togglePlay(); return; } S.idx = j; syncControls(); refresh(); }
 function togglePlay() {
@@ -514,22 +652,23 @@ function togglePlay() {
 /* ============================================================================= boot */
 async function boot() {
   map = createMap('map');
-  const [man, lab] = await Promise.all([
-    fetch(`data/latest.json?t=${Date.now()}`, { cache: 'no-store' }).then((r) => { if (!r.ok) throw new Error('data/latest.json not found yet — the pipeline has not published a run'); return r.json(); }),
-    fetch('basemap_labels.json').then((r) => r.json()),
-  ]);
-  S.man = man; S.base = `data/${man.base}`; S.steps = man.steps; man.steps.forEach((s) => S.byFhr.set(s.fhr, s));
+  const getJson = (u) => fetch(`${u}?t=${Date.now()}`, { cache: 'no-store' }).then((r) => (r.ok ? r.json() : null)).catch(() => null);
+  const [gl, gs, il, pl, lab] = await Promise.all([getJson('data/gefs/latest.json'), getJson('data/gefs/synoptic.json'), getJson('data/ifs/latest.json'),
+    getJson('data/geps/latest.json'), fetch('basemap_labels.json').then((r) => r.json())]);
+  S.sets = { gefs: { latest: gl, syn: gs }, ifs: { latest: il }, geps: { latest: pl } };
+  if (!loadedFams().length) throw new Error('No model data found yet \u2014 the pipeline has not published a run');
   lab.places.sort((a, b) => b[3] - a[3]); labelData = lab;
   const hs = Object.fromEntries(new URLSearchParams(location.hash.slice(1)));
-  S.product = ['qpf', 'snow', 'zr', 'pl', 'ptype'].includes(hs.p) && (!man.products || man.products.includes(hs.p)) ? hs.p : 'qpf';
+  if (hs.w === 'member') S.wmode = 'member';
+  const first = [hs.m, 'blend', ...FAM_KEYS].find((f) => f && setFamily(f, true));           // the requested view, else the best one that has data
+  const want = +hs.f || 24; S.idx = nearestIdx(want);
+  S.product = ['qpf', 'snow', 'zr', 'pl', 'ptype'].includes(hs.p) && S.products.includes(hs.p) ? hs.p : 'qpf';
   S.period = S.product === 'ptype' ? 'step' : hs.per === 'step' ? 'step' : [6, 12, 24, 48].includes(+hs.per) ? +hs.per : 24;
-  const want = +hs.f || 24; let best = S.steps.length - 1; S.steps.forEach((s, i) => { if (s.fhr === want) best = i; }); S.idx = Math.min(best, S.steps.length - 1);
   if (hs.s) S.stat = hs.s === 'median' ? 'p50' : hs.s;
   if ([2, 4, 6, 8].includes(+hs.r)) S.lpmmR = +hs.r;
-  S.hasSwe = !!(man.scales && man.scales.swe_mm_per_count);
   if (S.hasSwe && ['10', '12', '13'].includes(hs.slr)) S.slr = hs.slr;
   await new Promise((res) => (map.loaded() ? res() : map.once('load', res)));
-  wx = new WxLayer({ opacity: S.opacity }); wx.setDomain(man.domain);
+  wx = new WxLayer({ opacity: S.opacity }); wx.setDomain(S.domain);
   map.addLayer(wx, 'counties-hit');
   labels = new LabelLayer(map, $('#labels'), lab);
   const grat = () => { labels.step = updateGraticule(map); };
@@ -542,7 +681,7 @@ async function boot() {
   map.on('dragstart', () => hideTip());
   buildUI(); syncControls();
   $('#splash').hidden = true;
-  $('#t-gen').textContent = `Built ${new Date(man.generated).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' })}${man.complete ? '' : ' · run still filling in'}`;
+  $('#t-gen').textContent = `Built ${new Date(S.gen).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' })}${S.complete ? '' : ' \u00b7 run still filling in'}`;
   refresh();
 }
 boot().catch((e) => { console.error(e); $('#splash').hidden = false; $('#splash-msg').textContent = e.message; });

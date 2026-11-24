@@ -30,9 +30,13 @@ class ApcpAccumulator:
 
     def add(self, window: tuple[int, int], values: np.ndarray) -> np.ndarray:
         a, b = window
-        if a not in self.cum:
+        if a == 0 and a not in self.cum:                  # IFS and GEPS accumulate from the start of the run: the base is zero
+            base = np.zeros(self.shape, np.float32)
+        elif a not in self.cum:
             raise KeyError(f"accumulation window {a}-{b} needs cumulative at f{a:03d}, which is missing")
-        self.cum[b] = (self.cum[a] + np.nan_to_num(values, nan=0.0)).astype(np.float32)
+        else:
+            base = self.cum[a]
+        self.cum[b] = (base + np.nan_to_num(values, nan=0.0)).astype(np.float32)
         return self.cum[b]
 
     def step(self, fhr: int, prev_fhr: int) -> np.ndarray:

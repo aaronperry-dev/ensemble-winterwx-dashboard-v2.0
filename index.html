@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <link rel="icon" href="data:,">
-<title>GEFS Ensemble Winter Weather — QPF · Snow · Ice · Precipitation Type</title>
-<meta name="description" content="31-member GEFS ensemble QPF, snowfall, freezing rain, sleet and Revised Bourgouin precipitation type with rolling 3/6/12/24/48-hour accumulations, 10 days out.">
+<title>Ensemble Winter Weather — GEFS · IFS ENS · GEPS blend — QPF · Snow · Ice · Precipitation Type</title>
+<meta name="description" content="GEFS, ECMWF IFS ENS and GEPS ensemble QPF, snowfall, freezing rain, sleet and Revised Bourgouin precipitation type, alone or blended, with rolling 6/12/24/48-hour accumulations, 10 days out.">
 <link rel="stylesheet" href="maplibre-gl.css">
 <link rel="stylesheet" href="style.css">
 </head>
@@ -14,7 +14,7 @@
 <canvas id="labels"></canvas>
 
 <div id="titleblock">
-  <div id="t-main">GEFS ensemble</div>
+  <div id="t-main">Ensemble</div>
   <div id="t-valid"></div>
   <div id="t-init"></div>
   <div id="t-warn" class="warn" hidden></div>
@@ -23,13 +23,22 @@
 <button id="menu" aria-label="Show or hide controls">&#9776; Controls</button>
 
 <aside id="panel" aria-label="Controls">
-  <h1>GEFS Winter Weather</h1>
-  <p class="sub">31-member ensemble &middot; QPF &middot; snow &middot; ice &middot; type</p>
+  <h1>Ensemble Winter Weather</h1>
+  <p class="sub">GEFS &middot; ECMWF IFS ENS &middot; GEPS &middot; blend</p>
+
+  <label class="lbl">Model</label>
+  <div id="fam" class="seg"></div>
+  <div id="fam-note" class="fam-note"></div>
+  <div id="wmode-wrap" hidden>
+    <label class="lbl" for="wmode">Blend weighting</label>
+    <select id="wmode"><option value="model">Equal by model</option><option value="member">Equal by member</option></select>
+    <p id="wmode-help" class="fine"></p>
+  </div>
 
   <label class="lbl">Product</label>
   <div id="product" class="seg"></div>
 
-  <label class="lbl">Accumulation period <small id="period-note" hidden>(type is per 3-hr step)</small></label>
+  <label class="lbl">Accumulation period <small id="period-note" hidden>(type is per output step)</small></label>
   <div id="period" class="seg"></div>
 
   <label class="lbl" for="stat">Statistic / member</label>
@@ -66,13 +75,15 @@
 
   <details>
     <summary>Method &amp; data</summary>
-    <p><b>Precip type</b> uses the Revised Bourgouin algorithm (Birk et&nbsp;al. 2021, <i>Wea. Forecasting</i>) on each member's wet-bulb profile; its four probabilities (rain, snow, freezing rain, sleet) split that member's QPF. Freezing rain is limited to a 2&nbsp;m temperature of +1&nbsp;&deg;C or colder (sleet +3&nbsp;&deg;C), the warmer cases becoming rain. Where the model itself says at least 90&nbsp;% of the precipitation is frozen, the freezing-rain share is also capped by its liquid fraction (100&nbsp;&minus;&nbsp;percent frozen precipitation), and for accumulations the shares are averaged over each 3-hr step rather than taken at its end.</p>
+    <p><b>Precip type</b> uses the Revised Bourgouin algorithm (Birk et&nbsp;al. 2021, <i>Wea. Forecasting</i>) on each member's wet-bulb profile; its four probabilities (rain, snow, freezing rain, sleet) split that member's QPF. Freezing rain is limited to a 2&nbsp;m temperature of +1&nbsp;&deg;C or colder (sleet +3&nbsp;&deg;C), the warmer cases becoming rain. For GEFS only, where the model itself says at least 90&nbsp;% of the precipitation is frozen, the freezing-rain share is also capped by its liquid fraction (100&nbsp;&minus;&nbsp;percent frozen precipitation); IFS ENS and GEPS publish no such field, so they get no cap. For accumulations the shares are averaged over each 3-hr step rather than taken at its end.</p>
     <p><b>Snowfall</b> = 3-hr QPF &times; snow share &times; snow-to-liquid ratio, summed over the period. The default is Kuchera (warmest temperature surface&ndash;500&nbsp;mb, 12:1 baseline); the selector also offers a fixed 13:1, 12:1 or 10:1 applied to the snow liquid equivalent. Fixed ratios in the 12&ndash;13:1 range often verify better than 10:1 in the Northeast.</p>
     <p><b>Freezing rain</b> and <b>sleet</b> are the liquid-equivalent part of each member's QPF that the Bourgouin probabilities assign to that type. Freezing rain is not radial ice accretion (no wind, surface or icing-efficiency adjustment); sleet is liquid, not pellet depth.</p>
-    <p><b>Statistics</b> are computed per grid cell from the 31 member totals (percentiles interpolate between ranked members). <b>PMM</b> (Ebert 2001) keeps the ensemble-mean pattern but takes its amplitudes from all members pooled over the map; <b>LPMM</b> (Clark 2017; Snook et&nbsp;al.) does the same inside a neighborhood around each point.</p>
+    <p><b>Models.</b> GEFS (31 members, 15 pressure levels), ECMWF IFS ENS (50 perturbed members, no control, 5 levels) and ECCC GEPS (21 members, 5 levels) are all resampled to the same 0.5&deg; grid. The coarser IFS and GEPS profiles give the same dominant type as GEFS in about 97&ndash;98&nbsp;% of wet cells but produce somewhat more freezing rain, so treat their freezing-rain fields as a little high. IFS and GEPS were not verified against ASOS reports.</p>
+    <p><b>Blend.</b> The blend pools the members of the models that share the same initialization time (GEFS is matched to the newest 00/12Z cycle the others have) at the forecast hours all three provide. The default weights each model equally, so one GEFS member counts 1/31 of a third, an IFS member 1/50 and a GEPS member 1/21; &ldquo;Equal by member&rdquo; instead counts every member the same. Percentiles, probabilities, means, PMM and LPMM are all weighted, and the tooltip shows each model's own value next to the blend. A model that has not finished or is on an older run is left out and noted in the panel.</p>
+    <p><b>Statistics</b> are computed per grid cell from the member totals (percentiles interpolate between ranked members, or between weighted ranks in the blend). <b>PMM</b> (Ebert 2001) keeps the ensemble-mean pattern but takes its amplitudes from all members pooled over the map; <b>LPMM</b> (Clark 2017; Snook et&nbsp;al.) does the same inside a neighborhood around each point.</p>
     <p><b>Periods</b> are rolling windows ending at the selected hour. Before the window fits in the run, the total since initialization is shown.</p>
     <p>Hover (desktop) or tap (phone) the map for the ensemble breakdown at that point. Click to pin.</p>
-    <p class="fine">Data: NOAA/NCEP GEFS 0.5&deg;. Basemap: Natural Earth, US Census cartographic boundaries.</p>
+    <p class="fine">Data: NOAA/NCEP GEFS 0.5&deg;; ECMWF IFS ENS open data (CC BY 4.0); Environment and Climate Change Canada GEPS (Open Government Licence &ndash; Canada). Basemap: Natural Earth, US Census cartographic boundaries.</p>
   </details>
   <div id="t-gen" class="fine"></div>
 </aside>
@@ -94,10 +105,10 @@
   <div class="track"><input id="slider" type="range" min="0" max="0" value="0" aria-label="Forecast hour"><div id="days"></div></div>
 </footer>
 
-<div id="credits">Ensemble: NOAA GEFS &middot; Basemap: Natural Earth, US Census &middot; Web Mercator</div>
+<div id="credits">Ensembles: NOAA GEFS &middot; ECMWF IFS ENS open data (CC BY 4.0) &middot; ECCC GEPS &middot; Basemap: Natural Earth, US Census &middot; Web Mercator</div>
 <div id="busy" hidden></div>
 <div id="toast" hidden></div>
-<div id="splash"><div><b>Loading GEFS ensemble&hellip;</b><p id="splash-msg">Fetching the latest run.</p></div></div>
+<div id="splash"><div><b>Loading ensembles&hellip;</b><p id="splash-msg">Fetching the latest runs.</p></div></div>
 
 <script src="maplibre-gl.js"></script>
 <script src="colors.js"></script>

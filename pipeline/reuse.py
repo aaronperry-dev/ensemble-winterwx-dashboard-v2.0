@@ -23,7 +23,7 @@ from . import encode
 log = logging.getLogger("gefs.reuse")
 ROOT = Path(__file__).resolve().parent
 # Files whose contents change the numbers we publish.  Transport code (sources, http, ratelimit) and site assembly do not.
-REV_FILES = ("bourgouin.py", "config.py", "encode.py", "grib.py", "member.py", "products.py", "run.py")
+REV_FILES = ("bourgouin.py", "config.py", "encode.py", "families.py", "geps.py", "grib.py", "ifs.py", "member.py", "products.py", "run.py")
 
 
 def code_rev() -> str:
@@ -58,12 +58,13 @@ def _check_file(path: Path, kind: int, fhr: int, nmem: int) -> bool:
 
 
 def load_prior(base_url: str, run_dir: Path, cyc, members: list[str], domain: C.Domain, slr_mode: str,
-               fhrs: list[int], session: requests.Session | None = None) -> dict | None:
+               fhrs: list[int], session: requests.Session | None = None, family: str = "gefs",
+               manifest: str = "latest.json") -> dict | None:
     """Download and validate the published hours of this cycle.  Returns None when nothing can be reused."""
     import json
     session = session or requests.Session()
     base = base_url.rstrip("/")
-    raw = _get(session, f"{base}/latest.json?cb={int(time.time())}")
+    raw = _get(session, f"{base}/{manifest}?cb={int(time.time())}")
     if raw is None:
         log.info("reuse: no published data at %s", base)
         return None
@@ -73,7 +74,7 @@ def load_prior(base_url: str, run_dir: Path, cyc, members: list[str], domain: C.
         log.info("reuse: published latest.json is not valid JSON")
         return None
     want = {"init": cyc.strftime("%Y-%m-%dT%H:%M:%SZ"), "members": members, "domain": domain.to_dict(),
-            "slr_mode": slr_mode, "code_rev": code_rev(), "version": 1}
+            "slr_mode": slr_mode, "code_rev": code_rev(), "version": 1, "family": family}
     for k, v in want.items():
         if man.get(k) != v:
             why = "different cycle" if k == "init" else f"{k} differs" + (" (calculation code changed)" if k == "code_rev" else "")

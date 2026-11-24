@@ -1,26 +1,82 @@
-# GEFS Winter Weather
+# Ensemble Winter Weather: GEFS · ECMWF IFS ENS · GEPS · blend
 
-A 31-member GEFS ensemble viewer for **QPF, snowfall, freezing rain, sleet and precipitation type** (Revised Bourgouin method,
-Birk et al. 2021, *Weather and Forecasting*). A Python pipeline runs on GitHub Actions four times a day, writes
-small gzipped binary files, and deploys them with a static MapLibre/WebGL viewer to GitHub Pages. No data is
-committed to the repo.
+An ensemble viewer for **QPF, snowfall, freezing rain, sleet and precipitation type** (Revised Bourgouin method,
+Birk et al. 2021, *Weather and Forecasting*) from three ensemble families, shown separately or **blended into one
+product**: NOAA **GEFS** (31 members), ECMWF **IFS ENS** (50 members) and Environment Canada's **GEPS** (21 members).
+A Python pipeline runs on GitHub Actions, writes small gzipped binary files per model, and deploys them with a
+static MapLibre/WebGL viewer to GitHub Pages. No data is committed to the repo.
+
+## The three models and the blend
+
+| | GEFS | IFS ENS | GEPS |
+|---|---|---|---|
+| Members | 31 (control + 30) | 50 (perturbed only; the control is not in the open data) | 21 (control + 20) |
+| Cycles | 00/06/12/18Z | 00/12Z | 00/12Z |
+| Hours | 3-hourly to F240 | 3-hourly to F144, then 6-hourly | 3-hourly to F192, then 6-hourly |
+| Source | AWS S3 → GCS → NOMADS | `data.ecmwf.int` (AWS copy as fallback) | MSC datamart `dd.weather.gc.ca` |
+| Grid used | 0.5° | 0.25°, sub-sampled to the 0.5° points (exact, no interpolation) | 0.5° |
+| Pressure levels in the profile | 15 (1000–400 hPa) | 5 (1000, 925, 850, 700, 500) | 5 (same) |
+| Extra field | `CPOFP` (percent frozen), used for the freezing-rain cap | none | none |
+| Fetch | byte ranges per member (`.idx`) | byte ranges per member (JSON `.index`), 14 fields each | whole files, one per field, all members inside |
+| Credit | NOAA (public domain) | ECMWF open data, CC BY 4.0 | ECCC, Open Government Licence – Canada |
+
+All three go through the same decision tree (below) and are written in the same file format on the same 0.5° grid,
+so the viewer treats them alike.
+
+**The blend is made in the browser**, not in the pipeline: it pools the members of every model that shares the run
+time (up to 102 members) and applies the same statistics. Nothing is duplicated on the server.
+
+* **Weighting.** Default *equal by model*: each model carries the same total weight (a third each with all three), so
+  IFS's 50 members do not drown out GEPS's 21. The alternative, *equal by member*, counts every member the same. Mean,
+  probabilities and the type shares are weighted averages; percentiles are the weighted analogue of linear interpolation
+  between ranked members (identical to the usual one for equal weights); PMM and LPMM match amplitudes by cumulative
+  weight instead of by count. Single-model views use the original unweighted code, unchanged.
+* **Which run time.** IFS and GEPS exist only at 00/12Z. For the blend, GEFS also publishes the 00/12Z cycle that IFS and
+  GEPS have (`synoptic.json`, picked by `pipeline.run --synoptic-too`); on a 06/18Z run that is a second, mostly reused,
+  GEFS build. The blend uses the run time shared by the most models. A model still on an older run is left out and the
+  panel says so, so the blend never mixes initialisation times.
+* **Hours.** The blend has the hours every included model has: 3-hourly to F144, then 6-hourly. A "step" is the gap to
+  the previous shared hour (6 h beyond F144), and the accumulation windows stay exact.
+* The tooltip colours each member's dot by model and lists each model's mean next to the blend's statistics.
+
+**Fewer pressure levels.** IFS and GEPS open data carry 5 levels in the 1000–500 hPa range that matter (versus 15 for
+GEFS). Re-running the Bourgouin calculation on one GEFS cycle (8 members, 16 member-steps, 92,000 wet cells) with only
+those 5 levels gave the same dominant type as the full profile in 97.4 % of wet cells (7 levels: 98.3 %), but about 45 %
+more freezing-rain cells (3,177 vs 2,211 with 5 levels), and interpolating the coarse profile back to 15 levels did not
+remove that. So treat IFS and GEPS freezing rain as somewhat generous compared with GEFS, and remember it is the one
+type the ASOS check found hard to forecast anyway. The blend dilutes it by the model weights.
+
+**IFS and GEPS differ from GEFS in two more ways.** The percent-frozen cap needs `CPOFP`, which only GEFS publishes, so it is
+not applied to them. IFS gives 2 m dew point instead of humidity (converted with the Bolton formula), and IFS/GEPS
+precipitation accumulates from the start of the run, so each hour's total is the difference of two cumulative values.
 
 ## Set up (once)
 
 1. Create the repo and push this folder to `main`.
 2. **Settings → Pages → Build and deployment → Source: GitHub Actions.**
-3. **Actions → "GEFS winter weather" → Run workflow** (use `max_fhr = 48` for a quick first test).
+3. **Actions → "Ensemble winter weather (GEFS, IFS ENS, GEPS)" → Run workflow** (use `max_fhr = 48` for a quick first test).
 4. Your site is at `https://<user>.github.io/<repo>/`.
 
-The schedule is `40 4,10,16,22 * * *` UTC, about 4.5 hours after each cycle. The job waits up to 100 minutes
-for files that are not posted yet and publishes whatever is complete (the manifest says `complete: false` while a
-run is still filling in).
+The workflow has four jobs: `test`; `build`, a matrix of **three parallel jobs** (`gefs`, `ifs`, `geps`), each with its
+own runner, timeout and reuse; `assemble`, which collects whatever the three produced into one site; and `deploy`.
+One model being late or down does not stop the others: the site is deployed with the models that finished, and the
+viewer shows only those (the Blend button appears when at least two share a run time).
+
+The schedule is `40 4,8,10,16,20,22 * * *` UTC: the 04:40, 10:40, 16:40 and 22:40 runs pick up the GEFS cycles (about 4.5 hours
+after each), and the 08:40 and 20:40 runs pick up the new IFS cycle, which ECMWF posts about 8 hours after 00/12Z (GEPS is out
+after about 5.5). A run that finds a model's newest cycle not posted yet uses that model's previous cycle, which is
+already published and is simply reused. Each job waits up to 100 minutes for files that are not posted yet and publishes
+whatever is complete (the manifest says `complete: false` while a run is still filling in).
+
+Rough cost of a full 10-day run: GEFS about 31 members × 80 steps; IFS 50 × 64 steps × 14 messages (about 16 GB of ranged reads from
+ECMWF, ~45,000 requests held under 28/s); GEPS 72 steps × 14 whole files (about 4.5 GB). The published data is about 100 MB in
+total, since the files are mostly zeros and compress well.
 
 ## What the pipeline does
 
 | Step | Detail |
 |---|---|
-| Members / range | `c00` + `p01…p30` (31), 0.5° `pgrb2a` + `pgrb2b`. **10 days: 80 three-hourly steps, F003 to F240** (`--max-fhr` accepts up to 384; steps beyond F240 are 6-hourly) |
+| Members / range (GEFS) | `c00` + `p01…p30` (31), 0.5° `pgrb2a` + `pgrb2b`. **10 days: 80 three-hourly steps, F003 to F240** (`--max-fhr` accepts up to 384; steps beyond F240 are 6-hourly) |
 | Source order | AWS S3 `noaa-gefs-pds` → Google Cloud `gfs-ensemble-forecast-system` → NOMADS GRIB filter → NOMADS HTTP |
 | Byte ranges | S3, GCS and NOMADS HTTP: read the `.idx`, then request only the messages needed (byte-adjacent ones merged). About 20 requests and 5 MB per member-step |
 | NOMADS GRIB filter | A server-side CGI, so there is no file to byte-range. It subsets by variable, level and lat/lon box instead |
@@ -35,12 +91,12 @@ run is still filling in).
 
 ### Precipitation-type decision tree
 
-Applied to every member at every 3-hour step, in this order. Only fields in the GEFS 0.5° files are used (the 0.25° files have no pressure-level profiles).
+Applied to every member at every output step, in this order, for all three models. For GEFS only fields in the 0.5° files are used (the 0.25° GEFS files have no pressure-level profiles); IFS uses its 0.25° fields sub-sampled to 0.5°.
 
 1. **Is it precipitating?** Member 3-hr QPF ≥ 0.05 mm. Otherwise no type.
 2. **Profile-based type (Revised Bourgouin).** Wet-bulb profile from the 2 m level and pressure levels → melting and refreezing energy, ice-nucleation probability → % rain, snow, freezing rain, sleet. Surface wet-bulb above 0 °C turns any freezing rain into rain (paper, Appendix c).
 3. **2 m temperature gates** (the last step of the RAP/HRRR tree). Freezing rain needs a surface near freezing: above **+1 °C** its share becomes rain. Ice pellets need cold air: above **+3 °C** their share becomes rain. Snow is not gated, because the melting-energy test already handles it and only about 0.5 % of snow cells are above 3 °C. Where 2 m temperature is missing, no gate applies.
-4. **Model liquid-fraction cap**, only where the model says at least 90 % of the precipitation is frozen (`CPOFP` ≥ 90): freezing rain cannot exceed the liquid fraction it reports (100 − CPOFP). The excess goes to snow and sleet in proportion to their shares. Rain is never converted to snow. Below 90, or where CPOFP is missing, no cap applies.
+4. **Model liquid-fraction cap** (GEFS only, since only GEFS publishes `CPOFP`), only where the model says at least 90 % of the precipitation is frozen (`CPOFP` ≥ 90): freezing rain cannot exceed the liquid fraction it reports (100 − CPOFP). The excess goes to snow and sleet in proportion to their shares. Rain is never converted to snow. Below 90, or where CPOFP is missing, no cap applies.
 5. **Accumulations** (snow, freezing rain, sleet, snow liquid) use the mean of the type shares at the start and end of each step. The type map shows the end-of-step shares.
 6. **NCEP's own dominant-type flags are not used.** They were evaluated against ASOS (below) and Bourgouin scored slightly better for freezing rain (CSI 0.22 vs 0.20; AUC 0.77 vs 0.72) and overall (0.873 vs 0.864). Bourgouin also gives each member fractional type shares, which the QPF split and the type totals need, and it comes from the profile that is already downloaded.
 
@@ -99,32 +155,33 @@ works on exactly the members that exist for the selected window (a window needs 
 
 ## Not downloading the same cycle twice
 
-Every deploy builds a fresh site, so the only copy of a finished cycle is the one on the live Pages site. At the start of a run the pipeline reads `data/latest.json` from that site (`--reuse-from`, set by the workflow) and, if it is the **same cycle** made by the **same calculation code** (`code_rev` in the manifest) with the same members, grid and snow-ratio mode, it:
+Every deploy builds a fresh site, so the only copy of a finished cycle is the one on the live Pages site. At the start of a run the pipeline reads `data/<model>/latest.json` (GEFS also `synoptic.json`) from that site (`--reuse-from`, set by the workflow) and, if it is the **same cycle** made by the **same calculation code** (`code_rev` in the manifest) with the same members, grid and snow-ratio mode, it:
 
 * copies the published hours back from your own site (never from NOAA) and checks every file;
 * if the cycle is complete, stops there with no NOAA requests at all, so a push that only changes the viewer costs seconds;
 * if the cycle is partial, restores the running accumulators from the published files and downloads **only the missing hours**. Members dropped earlier stay dropped. Restored totals carry at most one file-quantization step of rounding (0.05 mm QPF, 0.1 cm snow);
 * falls back to a normal download when the cycle, code, members or snow mode differ, when no site exists yet, or from the first hour whose file is missing or damaged.
 
-Run the workflow by hand with `force_refresh` = true (or pass `--force`) to download everything again, for example to pick up members that were dropped on the first attempt. `code_rev` covers `bourgouin.py`, `config.py`, `encode.py`, `grib.py`, `member.py`, `products.py` and `run.py`; changes to the source/transport code or to the viewer do not invalidate published data.
+Run the workflow by hand with `force_refresh` = true (or pass `--force`) to download everything again, for example to pick up members that were dropped on the first attempt. `code_rev` covers `bourgouin.py`, `config.py`, `encode.py`, `families.py`, `geps.py`, `grib.py`, `ifs.py`, `member.py`, `products.py` and `run.py`; changes to the source/transport code or to the viewer do not invalidate published data.
 
-## Data format (`data/<yyyymmdd_cc>/…`, `data/latest.json`)
+## Data format (`data/<model>/<yyyymmdd_cc>/…`, `data/<model>/latest.json`)
 
-`latest.json` lists the run, domain, scales and every step. Each step has two files:
+`<model>` is `gefs`, `ifs` or `geps`. `latest.json` lists the run, `family`, `members`, pressure `levels`, domain, scales and every step (GEFS also has `synoptic.json`, the 00/12Z cycle that matches IFS/GEPS). Each step has two files:
 
 * `cum/fHHH.bin.gz`: **cumulative-since-init** `u16 [member][y][x]` arrays, in order: QPF (0.05 mm per count), snowfall (0.1 cm), freezing rain (0.01 mm liquid equivalent), sleet (0.01 mm liquid equivalent), snow liquid equivalent (0.02 mm, the fifth array). The header's `narr` byte gives the array count, so older 2- and 4-array files still read; the fifth scale sits at header offset 52.
 * `ptype/fHHH.bin.gz`: `u8 [4][member][y][x]` = % RA, SN, FZRA, PL (0 where the member's 3-hr QPF is below 0.05 mm).
 
 Cumulative storage means any rolling 3/6/12/24/48-hour total is just `cum(t) − cum(t−w)`, two small files fetched
-by the browser. A full run is about 25 MB. Domain: 60–20°N, 135–50°W, 0.5° (81 × 171). The 64-byte `GWX1` header is
-documented in `pipeline/encode.py`.
+by the browser. A full GEFS run is about 25 MB (IFS about 40 MB, GEPS about 20 MB). Domain: 60–20°N, 135–50°W, 0.5° (81 × 171). The 64-byte `GWX1` header is
+documented in `pipeline/encode.py`; its member bitmask spans 64 members (bits 0–31 at offset 48, 32–63 at offset 56) because IFS has 50.
 
 ## Viewer
 
 * MapLibre GL JS 4.7.1 (vendored), a self-hosted Natural Earth + US Census basemap (countries, states/provinces, counties, rivers, lakes), a graticule, and a canvas label layer with collision handling. There is no tile or font server.
 * A custom WebGL2 layer paints the data with crisp class edges at any zoom, using the NWS-style ramps from the three reference images.
-* Hover (desktop) or tap (phone) for a tooltip with mean, median, min, max, 10th/90th percentile, chance of exceeding thresholds, a dot strip of all 31 members and, for type, member counts and mean Bourgouin probabilities. Click to pin.
-* Statistics (computed in the browser from the 31 member totals of the selected window):
+* Hover (desktop) or tap (phone) for a tooltip with mean, median, min, max, 10th/90th percentile, chance of exceeding thresholds, a dot strip of all members (coloured by model in the blend, with each model's mean) and, for type, member counts and mean Bourgouin probabilities. Click to pin.
+* A **Model** selector (Blend, GEFS, IFS ENS, GEPS) and, for the blend, a weighting selector; both are kept in the URL (`m=`, `w=`).
+* Statistics (computed in the browser from the member totals of the selected window; weighted in the blend as described above):
   * **Min, P5, P10, P25, P50, Mean, P75, P90, P95, Max.** Percentiles interpolate linearly between ranked members (31 members, so P5 sits between the 2nd and 3rd lowest).
   * **PMM**, the probability-matched mean (Ebert 2001). The ensemble mean supplies the spatial pattern. All member values pooled over the whole map are ranked, and every 31st value is dealt back onto the mean field by rank. Amplitudes are no longer smoothed away, and the map-wide total stays close to the mean's.
   * **LPMM**, the local probability-matched mean (Clark 2017; Snook et al. 2019/2020). The same matching is done independently in a square neighborhood around each grid cell, which avoids mixing very different regimes (a coastal low and a dry interior). The neighborhood is selectable (±1° to ±4°; default ±2°, about 140 miles). Published LPM settings are tuned for 3-km convection-allowing ensembles, so treat the default as a starting point for 0.5° GEFS. Cells whose ensemble mean is zero stay zero.
@@ -138,7 +195,8 @@ documented in `pipeline/encode.py`.
 ## Layout
 
 ```
-pipeline/        data pipeline (python -m pipeline.run, pipeline.site); pipeline/reuse.py skips hours already published
+pipeline/        data pipeline (python -m pipeline.run --family gefs|ifs|geps, pipeline.site); pipeline/reuse.py skips hours already published
+                 families.py (the three models), ifs.py and geps.py (their fetchers), run.py (shared orchestration)
 tests/           pytest suite, no network needed
 index.html style.css viewer.js basemap.js wxlayer.js colors.js ensstats.js statworker.js   viewer
 basemap_*.json   boundaries and labels (build_basemap.py regenerates them)
@@ -149,5 +207,8 @@ maplibre-gl.*    vendored MapLibre
 ## Caveats
 
 * The Google Cloud source could not be reached from the development sandbox, so its fallback is covered only by the mock-server tests. The AWS and NOMADS filter paths were run against real data.
-* The 2-D GEFS fields are 0.5°, so precipitation type is smooth and not suitable for sub-county detail.
-* Basemap: Natural Earth (public domain), US Census cartographic boundary data via us-atlas. Ensemble data: NOAA/NCEP GEFS (public domain).
+* The fields are 0.5°, so precipitation type is smooth and not suitable for sub-county detail.
+* IFS ENS open data has no control member, so the IFS ensemble is 50 perturbed members. GEPS was only checked against the one live cycle available during development; its datamart keeps files for a limited time, so a run started long after the cycle may find them gone.
+* The ASOS verification above covered GEFS only; IFS and GEPS are processed the same way but have not been verified separately.
+* A model that fails to build for a cycle is missing from that deploy (the site is rebuilt from the job outputs each time), until its next successful run.
+* Basemap: Natural Earth (public domain), US Census cartographic boundary data via us-atlas. Ensemble data: NOAA/NCEP GEFS (public domain), ECMWF IFS ENS open data (CC BY 4.0, attribution required), ECCC GEPS (Open Government Licence – Canada).

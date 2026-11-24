@@ -2,7 +2,7 @@
 'use strict';
 importScripts('ensstats.js');
 self.onmessage = (e) => {
-  const { id, data, M, ny, nx, stat, radius } = e.data;
-  try { const out = EnsStats.compute(data, M, ny, nx, stat, { radius }); self.postMessage({ id, out }, [out.buffer]); }
+  const { id, data, M, ny, nx, stat, radius, weights } = e.data;
+  try { const out = EnsStats.compute(data, M, ny, nx, stat, { radius, weights }); self.postMessage({ id, out }, [out.buffer]); }
   catch (err) { self.postMessage({ id, error: String(err && err.message || err) }); }
 };

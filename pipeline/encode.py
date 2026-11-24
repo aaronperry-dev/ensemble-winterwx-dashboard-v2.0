@@ -19,8 +19,10 @@ File layout (little-endian), 64-byte header then raw arrays:
   36      f32    scale1  kind 1: cm of snow per count
   40      f32    scale2  kind 1: mm of liquid per count, freezing rain
   44      f32    scale3  kind 1: mm of liquid per count, sleet / ice pellets
-  48      u32    member bitmask: bit k set = member k (c00, p01 ...) has data in this file. 0 = legacy file, all present
-  52..63  zero padding
+  48      u32    member bitmask, members 0-31: bit k set = member k (c00, p01 ...) has data in this file. 0 = legacy file, all present
+  52      f32    scale4  kind 1: mm of liquid per count, snow liquid equivalent (any snow ratio can be applied to it)
+  56      u32    member bitmask, members 32-63 (IFS has 50 members; 0 for the 31-member GEFS)
+  60..63  zero padding
 
  kind 1 body:  u16 [nmem][ny][nx] cumulative QPF, snowfall, freezing rain (liquid eq.), sleet (liquid eq.), in that order.
                Any rolling window total is  cum(t) - cum(t - window)  -- two small files.
@@ -38,7 +40,7 @@ import numpy as np
 from . import config as C
 
 MAGIC = b"GWX1"
-HEADER = struct.Struct("<4sBBHHHHHffffffffIf")      # ... mask, then the 5th scale (snow liquid equivalent)
+HEADER = struct.Struct("<4sBBHHHHHffffffffIfI")     # ... mask (members 0-31), the 5th scale (snow liquid equivalent), mask (members 32-63)
 HEADER_SIZE = 64
 KIND_CUM, KIND_PTYPE = 1, 2
 
@@ -55,9 +57,12 @@ def mask_of(present_idx) -> int:
 
 
 def _header(kind, nmem, ny, nx, fhr, step_h, domain: C.Domain, scales=(0.0,) * 5, narr=0, mask=0) -> bytes:
+    if nmem > 64:
+        raise ValueError("the member bitmask holds at most 64 members")
     scales = tuple(scales) + (0.0,) * (5 - len(scales))
     raw = HEADER.pack(MAGIC, kind, narr, nmem, ny, nx, fhr, step_h,
-                      domain.lat_north, domain.lon_west, domain.res, domain.res, *scales[:4], mask, scales[4])
+                      domain.lat_north, domain.lon_west, domain.res, domain.res, *scales[:4], mask & 0xFFFFFFFF, scales[4],
+                      (mask >> 32) & 0xFFFFFFFF)
     return raw + b"\x00" * (HEADER_SIZE - len(raw))
 
 
@@ -101,7 +106,8 @@ def write_ptype(path: Path, fhr: int, step_h: int, probs_u8: np.ndarray, domain:
 def read_bin(path: Path) -> dict:
     """Reference reader (used by tests; the browser has its own JS reader)."""
     raw = gzip.open(path, "rb").read()
-    (magic, kind, narr, nmem, ny, nx, fhr, step_h, lat0, lon0, dlat, dlon, s0, s1, s2, s3, mask, s4) = HEADER.unpack_from(raw)
+    (magic, kind, narr, nmem, ny, nx, fhr, step_h, lat0, lon0, dlat, dlon, s0, s1, s2, s3, mask, s4, mask_hi) = HEADER.unpack_from(raw)
+    mask |= mask_hi << 32
     if magic != MAGIC:
         raise ValueError("bad magic")
     n = nmem * ny * nx

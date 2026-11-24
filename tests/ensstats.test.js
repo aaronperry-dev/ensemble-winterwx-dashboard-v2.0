@@ -116,3 +116,87 @@ test('statistics over a compacted member set ignore the dropped member entirely'
     assert.ok(Math.max(...a) < 1e5);
   }
 });
+
+// ---------------------------------------------------------------------------------------------- weighted statistics
+function weightsFor(sizes, byModel = true) {            // e.g. [31, 50, 21]: each model counts the same, or every member the same
+  const w = []; sizes.forEach((n) => { for (let k = 0; k < n; k++) w.push(byModel ? 1 / (sizes.length * n) : 1 / sizes.reduce((a, b) => a + b, 0)); });
+  return Float32Array.from(w);
+}
+
+test('equal weights give exactly the unweighted results (single-model views do not change)', () => {
+  const M = 31, ny = 8, nx = 10, d = synth(M, ny, nx, 4), w = new Float32Array(M).fill(0.2);
+  for (const s of ['mean', 'min', 'max', 'p10', 'p50', 'p95', 'pmm', 'lpmm']) {
+    const a = E.compute(d, M, ny, nx, s, { radius: 2 }), b = E.compute(d, M, ny, nx, s, { radius: 2, weights: w });
+    for (let i = 0; i < ny * nx; i++) assert.equal(a[i], b[i], s);
+  }
+  assert.equal(E.normWeights(w, M), null);
+  assert.equal(E.normWeights(weightsFor([31, 50, 21], false), 102), null);          // equal-by-member is the unweighted path too
+  assert.ok(E.normWeights(weightsFor([31, 50, 21], true), 102));
+});
+
+test('weighted percentile equals the unweighted one for equal weights and moves toward heavy members otherwise', () => {
+  const v = Array.from({ length: 31 }, (_, i) => i), eq = new Array(31).fill(1);
+  for (const p of [0, 0.05, 0.25, 0.5, 0.9, 1]) assert.ok(Math.abs(E.wPercentile(v, eq, p) - E.percentile(Float32Array.from(v), 31, p)) < 1e-9, `p=${p}`);
+  assert.equal(E.wPercentile([0, 5, 10], [0.1, 0.1, 0.8], 0), 0);
+  assert.equal(E.wPercentile([0, 5, 10], [0.1, 0.1, 0.8], 1), 10);
+  const med = E.wPercentile([0, 5, 10], [0.1, 0.1, 0.8], 0.5);
+  assert.ok(med > 5 && med < 10, `median ${med} should lean toward the heavy member`);
+  assert.ok(Math.abs(E.wPercentile([7, 1, 3], [2, 5, 3], 0.5) - E.wPercentile([1, 3, 7], [5, 3, 2], 0.5)) < 1e-12, 'order of input does not matter');
+});
+
+test('weighted mean and probabilities-by-weight match hand calculations; a heavy model pulls the mean', () => {
+  const M = 3, d = Float32Array.from([0, 6, 12]), w = Float32Array.from([1, 1, 2]);
+  assert.ok(Math.abs(E.compute(d, M, 1, 1, 'mean', { weights: w })[0] - 7.5) < 1e-6);
+  assert.equal(E.compute(d, M, 1, 1, 'max', { weights: w })[0], 12);
+  assert.equal(E.compute(d, M, 1, 1, 'min', { weights: w })[0], 0);
+});
+
+test('weighted percentiles stay ordered and inside the member range', () => {
+  const sizes = [31, 50, 21], M = 102, ny = 14, nx = 18, N = ny * nx, d = synth(M, ny, nx, 13), w = weightsFor(sizes);
+  const keys = ['min', 'p5', 'p10', 'p25', 'p50', 'p75', 'p90', 'p95', 'max'], f = {};
+  for (const k of keys) f[k] = E.compute(d, M, ny, nx, k, { weights: w });
+  for (let i = 0; i < N; i++) for (let k = 1; k < keys.length; k++) assert.ok(f[keys[k]][i] >= f[keys[k - 1]][i] - 1e-5, `${keys[k]} at ${i}`);
+});
+
+test('weighted PMM: monotone in the weighted mean, amplitudes from the weighted pool, zero where the mean is zero', () => {
+  const sizes = [6, 10, 4], M = 20, ny = 16, nx = 22, N = ny * nx, d = synth(M, ny, nx, 17), w = weightsFor(sizes);
+  const mean = E.meanFieldW(d, M, N, E.normWeights(w, M)), pm = E.compute(d, M, ny, nx, 'pmm', { weights: w });
+  const idx = Array.from({ length: N }, (_, i) => i).sort((a, b) => mean[a] - mean[b]);
+  for (let j = 1; j < N; j++) assert.ok(pm[idx[j]] >= pm[idx[j - 1]]);
+  for (let i = 0; i < N; i++) if (mean[i] === 0) assert.equal(pm[i], 0);
+  // brute force: pooled (value, weight) pairs sorted; the cell of rank j gets the value covering mass j + 0.5
+  const wn = E.normWeights(w, M), pairs = []; for (let m = 0; m < M; m++) for (let i = 0; i < N; i++) pairs.push([d[m * N + i], wn[m]]);
+  pairs.sort((a, b) => a[0] - b[0]);
+  const ref = new Float32Array(N); let cum = 0, j = 0;
+  for (const [v, wt] of pairs) { cum += wt; while (j < N && j + 0.5 < cum) ref[idx[j++]] = v; }
+  while (j < N) ref[idx[j++]] = pairs[pairs.length - 1][0];
+  for (let i = 0; i < N; i++) assert.ok(Math.abs(pm[i] - ref[i]) < 1e-5, `cell ${i}: ${pm[i]} vs ${ref[i]}`);
+  assert.ok(Math.max(...pm) > Math.max(...mean) * 1.2);
+});
+
+test('weighted LPMM with a window covering the whole domain equals weighted PMM, and matches brute force locally', () => {
+  const sizes = [5, 8, 3], M = 16, ny = 9, nx = 12, N = ny * nx, d = synth(M, ny, nx, 23), w = weightsFor(sizes);
+  const a = E.compute(d, M, ny, nx, 'lpmm', { radius: 40, weights: w }), b = E.compute(d, M, ny, nx, 'pmm', { weights: w });
+  for (let i = 0; i < N; i++) assert.ok(Math.abs(a[i] - b[i]) < 1e-5, `cell ${i}`);
+  const R = 2, wn = E.normWeights(w, M), lp = E.compute(d, M, ny, nx, 'lpmm', { radius: R, weights: w }), mean = E.meanFieldW(d, M, N, wn);
+  for (let y = 0; y < ny; y++) for (let x = 0; x < nx; x++) {
+    const i = y * nx + x; if (!(mean[i] > 0)) continue;
+    const pairs = [], means = [];
+    for (let yy = Math.max(0, y - R); yy <= Math.min(ny - 1, y + R); yy++) for (let xx = Math.max(0, x - R); xx <= Math.min(nx - 1, x + R); xx++) {
+      means.push(mean[yy * nx + xx]); for (let m = 0; m < M; m++) pairs.push([d[m * N + yy * nx + xx], wn[m]]);
+    }
+    pairs.sort((p, q) => p[0] - q[0]);
+    const less = means.filter((v) => v < mean[i]).length, eq = means.filter((v) => v === mean[i]).length, t = less + ((eq - 1) >> 1) + 0.5;
+    let cum = 0, val = pairs[pairs.length - 1][0];
+    for (const [v, wt] of pairs) { cum += wt; if (t < cum) { val = v; break; } }
+    assert.ok(Math.abs(lp[i] - val) < 1e-5, `cell ${i}: ${lp[i]} vs ${val}`);
+  }
+});
+
+test('weighted statistics on a full 102-member blend are fast enough for a background worker', () => {
+  const sizes = [31, 50, 21], M = 102, ny = 81, nx = 171, d = synth(M, ny, nx, 2), w = weightsFor(sizes);
+  for (const [s, R, lim] of [['p50', 4, 4000], ['mean', 4, 2000], ['pmm', 4, 12000], ['lpmm', 4, 40000]]) {
+    const t = performance.now(); E.compute(d, M, ny, nx, s, { radius: R, weights: w }); const ms = performance.now() - t;
+    console.log(`weighted ${s}${s === 'lpmm' ? ` R=${R}` : ''} (102 members): ${ms.toFixed(0)} ms`); assert.ok(ms < lim);
+  }
+});
