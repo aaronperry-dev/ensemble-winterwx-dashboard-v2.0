@@ -55,6 +55,30 @@ def type_qpf_step_mm(qpf_mm: np.ndarray, probs: np.ndarray) -> np.ndarray:
     return (type_shares(probs) * qpf_mm[None]).astype(np.float32)
 
 
+def surface_temperature_gates(probs: np.ndarray, t2_c: np.ndarray | None, fz_max: float = C.FZRA_MAX_T2_C,
+                              pl_max: float = C.PL_MAX_T2_C) -> np.ndarray:
+    """2 m temperature checks on the profile-based type (the last step of the RAP/HRRR precip-type tree, applied to Bourgouin).
+
+    probs: (4, ...) percent [RA, SN, FZRA, PL]; t2_c: 2 m temperature in deg C, same trailing shape (NaN = unknown, no gate).
+    Freezing rain needs a surface near or below freezing, so where T2m is above `fz_max` its share becomes rain; ice pellets
+    need cold air at the surface, so above `pl_max` theirs becomes rain too.  The wet-bulb surface test inside Bourgouin
+    only catches Tw > 0 C; in dry air Tw can be below 0 C while the air is a degree or two above it.  Snow is not gated:
+    Bourgouin's own melting-energy test already handles it.
+    """
+    if t2_c is None:
+        return probs
+    p = probs.astype(np.float32)
+    ok = np.isfinite(t2_c)
+    t = np.where(ok, t2_c, 0.0)
+    out = p.copy()
+    fz = ok & (t > fz_max)
+    pl = ok & (t > pl_max)
+    out[0] = p[0] + np.where(fz, p[2], 0.0) + np.where(pl, p[3], 0.0)
+    out[2] = np.where(fz, 0.0, p[2])
+    out[3] = np.where(pl, 0.0, p[3])
+    return np.rint(np.minimum(out, 100.0)).astype(np.uint8)
+
+
 def cap_freezing_rain(probs: np.ndarray, cpofp: np.ndarray | None) -> np.ndarray:
     """Do not let freezing rain exceed the liquid fraction that the model's own microphysics reports.
 

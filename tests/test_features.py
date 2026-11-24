@@ -6,7 +6,7 @@ from pipeline import config as C
 from pipeline import encode
 from pipeline.encode import read_bin
 from pipeline.member import type_extras
-from pipeline.products import cap_freezing_rain, step_average_shares, type_shares
+from pipeline.products import cap_freezing_rain, step_average_shares, surface_temperature_gates, type_shares
 from tests.test_policy import Fake, NX, NY, go
 from tests.test_sources import FieldSpec, Handler, SPECS, T, WANT, chain, server  # noqa: F401  (server is a fixture)
 
@@ -84,6 +84,21 @@ def test_cum_and_ptype_files_round_trip_the_new_arrays(tmp_path):
     assert "ncep" not in read_bin(tmp_path / "p0.bin.gz")
 
 
+# ------------------------------------------------------------------ 2 m temperature gates
+def test_surface_temperature_gates():
+    p = np.zeros((4, 1, 1, 5), np.uint8)
+    p[:, 0, 0, :] = np.array([[10], [20], [60], [10]])                               # RA 10, SN 20, FZRA 60, PL 10
+    t2 = np.array([[[-2.0, 0.9, 1.1, 3.5, np.nan]]], np.float32)
+    out = surface_temperature_gates(p, t2)
+    assert out[:, 0, 0, 0].tolist() == [10, 20, 60, 10]                              # cold: untouched
+    assert out[:, 0, 0, 1].tolist() == [10, 20, 60, 10]                              # 0.9 C: still allowed
+    assert out[:, 0, 0, 2].tolist() == [70, 20, 0, 10]                               # 1.1 C: freezing rain -> rain, sleet kept
+    assert out[:, 0, 0, 3].tolist() == [80, 20, 0, 0]                                # 3.5 C: sleet -> rain as well; snow is never gated
+    assert out[:, 0, 0, 4].tolist() == [10, 20, 60, 10]                              # unknown temperature: no gate
+    assert (out.sum(axis=0) == 100).all()                                            # shares are conserved
+    assert surface_temperature_gates(p, None) is p
+
+
 # ------------------------------------------------------------------ optional fields
 def test_optional_fields_missing_from_the_inventory_are_skipped(server):  # noqa: F811
     spec = SPECS + [FieldSpec("a", "CSNOW", "surface", "CSNOW", True)]               # the mock inventory has no CSNOW
@@ -105,9 +120,11 @@ class Weather(Fake):
         probs = np.zeros((4, NY, NX), np.uint8)
         probs[0 if fhr == 3 else 1] = 100
         probs[:, 0, 0] = [0, 30, 70, 0]                                              # cell (0, 0): the cold-top case
+        probs[:, 1, 1] = [0, 0, 100, 0]                                              # cell (1, 1): freezing rain at 2.85 C -> rain
         cp = np.full((NY, NX), 50.0, np.float32); cp[0, 0] = 80.0
         code = np.full((NY, NX), 0 if fhr == 3 else 1, np.uint8)
-        return {**r, "probs": probs, "cpofp": cp, "ncep": code}
+        t2 = np.full((NY, NX), 270.0, np.float32); t2[1, 1] = 276.0                  # cell (1, 1) is 2.85 C
+        return {**r, "probs": probs, "cpofp": cp, "ncep": code, "t2": t2}
 
 
 def test_run_applies_cap_step_average_and_stores_ncep_and_swe(tmp_path):
@@ -117,6 +134,7 @@ def test_run_applies_cap_step_average_and_stores_ncep_and_swe(tmp_path):
     pt3, pt6 = read_bin(run / "ptype/f003.bin.gz"), read_bin(run / "ptype/f006.bin.gz")
     assert pt3["probs"][:, 0, 0, 0].tolist() == [0, 80, 20, 0]                       # cap: 70 -> 20, excess 50 -> snow
     assert pt6["probs"][:, 0, 5, 5].tolist() == [0, 100, 0, 0]                       # the map shows the end-of-step type
+    assert pt3["probs"][:, 0, 1, 1].tolist() == [100, 0, 0, 0]                       # 2 m temperature gate: too warm for freezing rain
     assert (pt3["ncep"][:, 3, 3] == 0).all() and (pt6["ncep"][:, 3, 3] == 1).all()
     c3, c6 = read_bin(run / "cum/f003.bin.gz"), read_bin(run / "cum/f006.bin.gz")
     # member 0: 3 mm per 3 h.  f003 is all rain -> no snow; f006 averages rain (start) and snow (end) -> half snow

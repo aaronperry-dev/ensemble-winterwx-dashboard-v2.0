@@ -28,10 +28,24 @@ run is still filling in).
 | Precip type | Wet-bulb profile → melting/refreezing energy → ProbIce, ProbSN, ProbPL, ProbFZRA (Eqs. 2, 7–9). Each member's 3-hr QPF is split among types by probability share |
 | Freezing rain, sleet | Liquid-equivalent accumulations: each step's QPF × the member's freezing-rain (or sleet) share, summed. Not radial ice accretion and not pellet depth |
 | Snowfall | QPF × snow share × SLR / 10 (cm). SLR is **Kuchera** by default (clamped 5–30, 12:1 baseline), or fixed with `--slr-mode fixed:12.5` / the workflow input. The files also store the snow liquid equivalent, so the viewer's **Snow-to-liquid ratio** selector (Kuchera, 13:1, 12:1, 10:1) needs no new data |
+| 2 m temperature gates | Freezing rain becomes rain where 2 m temperature is above +1 °C, and ice pellets become rain above +3 °C (`FZRA_MAX_T2_C`, `PL_MAX_T2_C` in `pipeline/config.py`). 2 m temperature is already downloaded, so there is no extra cost. On one cycle (F024 and F060, 31 members) it removed 13 % of Bourgouin's freezing-rain cells and 31 % of the cells where NCEP says rain |
 | Freezing-rain cap | GEFS publishes `CPOFP` (percent frozen precipitation). A member's freezing-rain share is capped at (100 − CPOFP)% of its QPF; the excess goes to snow and sleet in proportion to their shares (all to snow if both are zero). Rain is never turned into snow. The cap is one-sided and partial on purpose: Bourgouin's ice-nucleation logic captures real supercooled cases that the model's own diagnosis can miss. If `CPOFP` is missing for a member-hour, no cap is applied |
 | Step-averaged shares | Accumulations (snow, freezing rain, sleet, snow liquid) use the mean of the type shares at the start and end of each 3-hr step, because the QPF fell over the whole step. The precip-type map keeps the end-of-step shares. Where only one end has a type, that end is used |
 | NCEP dominant type | `CRAIN`, `CSNOW`, `CICEP`, `CFRZR` (binary flags at the valid time) are stored per member, tie order freezing rain > snow > sleet > rain. NCEP's type is dropped where the member's 3-hr QPF is under 0.05 mm, the same wet mask Bourgouin uses. They drive the alternate type map, the NCEP probabilities and the Bourgouin-vs-NCEP agreement layer. They are optional: a missing flag leaves the member "unknown" and nothing fails |
 | Heights | Hypsometric integration of virtual temperature, so no height download is needed |
+
+### Precipitation-type decision tree
+
+Applied to every member at every 3-hour step, in this order. Only fields in the GEFS 0.5° files are used (the 0.25° files have no pressure-level profiles).
+
+1. **Is it precipitating?** Member 3-hr QPF ≥ 0.05 mm. Otherwise no type (both Bourgouin and NCEP's type are blanked, so trace amounts never count as a disagreement).
+2. **Profile-based type (Revised Bourgouin).** Wet-bulb profile from the 2 m level and pressure levels → melting and refreezing energy, ice-nucleation probability → % rain, snow, freezing rain, sleet. Surface wet-bulb above 0 °C turns any freezing rain into rain (paper, Appendix c).
+3. **2 m temperature gates** (the last step of the RAP/HRRR tree). Freezing rain needs a surface near freezing: above **+1 °C** its share becomes rain. Ice pellets need cold air: above **+3 °C** their share becomes rain. Snow is not gated, because the melting-energy test already handles it and only about 0.5 % of snow cells are above 3 °C. Where 2 m temperature is missing, no gate applies.
+4. **Model liquid-fraction cap.** Freezing rain cannot exceed the liquid fraction the model reports itself (100 − CPOFP). The excess goes to snow and sleet in proportion to their shares. Rain is never converted to snow. If CPOFP is missing, no cap applies.
+5. **Accumulations** (snow, freezing rain, sleet, snow liquid) use the mean of the type shares at the start and end of each step. The type map shows the end-of-step shares.
+6. **Alternate view: NCEP's own dominant type** (four wet-bulb schemes, ties resolved freezing rain > snow > sleet > rain) and the **agreement** layer. These are shown next to Bourgouin and are **not blended into it**: no observation-based verification exists here yet to say which method deserves more weight, and the two differ mainly on marginal freezing-rain cases.
+
+Known limits: Bourgouin's supercooled-liquid branch (cloud tops warmer than about −10 °C, no warm layer) still produces some freezing rain at very cold surface temperatures where NCEP shows snow. That is a candidate for the next round of tuning, but it should be tuned against observations (ASOS present weather, mPING), not against NCEP's flags.
 
 Run it locally:
 

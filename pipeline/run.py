@@ -31,8 +31,8 @@ from . import config as C
 from . import encode, reuse
 from .http import HttpClient, NotAvailable, SourceError
 from .member import compute_member_step, fetch_fields, type_extras
-from .products import (ApcpAccumulator, cap_freezing_rain, snowfall_step_cm, step_average_shares, type_qpf_step_mm,
-                       type_shares)
+from .products import (ApcpAccumulator, cap_freezing_rain, snowfall_step_cm, step_average_shares, surface_temperature_gates,
+                       type_qpf_step_mm, type_shares)
 from .ratelimit import build_gates
 from .sources import SourceChain, Target
 
@@ -60,7 +60,7 @@ def run_task(task: tuple[str, str, str, int]) -> dict:
         probs, slr = compute_member_step(fields, slr_mode=cfg["slr_mode"])
         cpofp, ncep = type_extras(fields)
         return {**base, "status": "ok", "window": window, "apcp": fields["APCP"],
-                "probs": probs, "slr": slr, "cpofp": cpofp, "ncep": ncep, "sources": used}
+                "probs": probs, "slr": slr, "cpofp": cpofp, "ncep": ncep, "t2": fields["T2"], "sources": used}
     except NotAvailable as e:
         return {**base, "status": "unavailable", "msg": str(e)}
     except Exception as e:  # noqa: BLE001 - report everything back to the scheduler
@@ -318,17 +318,21 @@ def finalize_step(fhr, prev_fhr, members, res, acc, cum_x, run_dir, domain, step
     slr = np.full((M, ny, nx), 12.0, np.float32)
     cpofp = np.full((M, ny, nx), np.nan, np.float32)                      # model % frozen precipitation (NaN = unknown)
     ncep = np.full((M, ny, nx), C.NCEP_UNKNOWN, np.uint8)                 # NCEP's own dominant type, when published
+    t2c = np.full((M, ny, nx), np.nan, np.float32)                        # 2 m temperature, deg C (NaN = unknown)
     for i, m in zip(idx, present):
         apcp[i], probs[:, i], slr[i] = res[m]["apcp"], res[m]["probs"], res[m]["slr"]
         if res[m].get("cpofp") is not None:
             cpofp[i] = res[m]["cpofp"]
         if res[m].get("ncep") is not None:
             ncep[i] = res[m]["ncep"]
+        if res[m].get("t2") is not None:
+            t2c[i] = res[m]["t2"] - 273.15
     acc.add(win, apcp)
     qpf = acc.step(fhr, prev_fhr)                                         # (M, ny, nx) mm
     wet = qpf >= C.MIN_PRECIP_MM
     ncep = np.where(wet | (ncep == C.NCEP_UNKNOWN), ncep, C.NCEP_NONE).astype(np.uint8)   # same wet mask as Bourgouin: no type for trace amounts
-    probs = cap_freezing_rain(probs, cpofp if np.isfinite(cpofp).any() else None)
+    probs = surface_temperature_gates(probs, t2c if np.isfinite(t2c).any() else None)       # 1. 2 m temperature checks
+    probs = cap_freezing_rain(probs, cpofp if np.isfinite(cpofp).any() else None)            # 2. the model's own liquid fraction
     probs = (probs * wet[None]).astype(np.uint8)                          # what the ptype map shows: end-of-step type
     carry = carry if carry is not None else {"probs": None}
     shares = step_average_shares(probs, carry["probs"])                   # what the accumulations use: mean over the step
