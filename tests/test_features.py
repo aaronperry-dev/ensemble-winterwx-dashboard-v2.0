@@ -1,11 +1,11 @@
-"""Model-side type information (CPOFP, NCEP flags), step-averaged type shares, and the snow liquid-equivalent array."""
+"""Model-side percent-frozen cap, 2 m temperature gates, step-averaged type shares, and the snow liquid-equivalent array."""
 import numpy as np
 import pytest
 
 from pipeline import config as C
 from pipeline import encode
 from pipeline.encode import read_bin
-from pipeline.member import type_extras
+from pipeline.member import cpofp_from
 from pipeline.products import cap_freezing_rain, step_average_shares, surface_temperature_gates, type_shares
 from tests.test_policy import Fake, NX, NY, go
 from tests.test_sources import FieldSpec, Handler, SPECS, T, WANT, chain, server  # noqa: F401  (server is a fixture)
@@ -61,19 +61,12 @@ def test_step_average_uses_the_end_that_has_a_type_and_the_first_step_alone():
     assert step_average_shares(P(), P())[:, 0].tolist() == [0, 0, 0, 0]
 
 
-# ------------------------------------------------------------------ NCEP flags -> one code per cell
-def test_type_extras_priority_and_missing():
+# ------------------------------------------------------------------ model percent-frozen field
+def test_cpofp_from_handles_no_precip_and_missing():
     z = np.zeros((1, 3), np.float32)
-    f = {k: z.copy() for k in ("CRAIN", "CSNOW", "CFRZR", "CICEP")}
-    f["CRAIN"][0, 0] = 1; f["CSNOW"][0, 1] = 1; f["CFRZR"][0, 2] = 1
-    f["CRAIN"][0, 2] = 1                                                             # both set: freezing rain wins
-    f["CPOFP"] = np.array([[-50.0, 40.0, 100.0]], np.float32)
-    cp, code = type_extras(f)
-    assert code[0].tolist() == [0, 1, 2] and np.isnan(cp[0, 0]) and cp[0, 1] == 40.0
-    f["CRAIN"][:] = 0; f["CSNOW"][:] = 0; f["CFRZR"][:] = 0
-    assert type_extras(f)[1][0].tolist() == [C.NCEP_NONE] * 3
-    cp2, code2 = type_extras({"T2": z})                                              # none of the optional fields present
-    assert cp2 is None and code2 is None
+    cp = cpofp_from({"CPOFP": np.array([[-50.0, 40.0, 100.0]], np.float32)})
+    assert np.isnan(cp[0, 0]) and cp[0, 1] == 40.0 and cp[0, 2] == 100.0           # -50 means no precipitation
+    assert cpofp_from({"T2": z}) is None                                             # not in the files
 
 
 # ------------------------------------------------------------------ file format
@@ -85,12 +78,8 @@ def test_cum_and_ptype_files_round_trip_the_new_arrays(tmp_path):
     d = read_bin(tmp_path / "c.bin.gz")
     assert np.allclose(d["swe_mm"], 7.0, atol=0.02) and np.allclose(d["zr_mm"], 1.0) and np.allclose(d["qpf_mm"], 10.0, atol=0.05)
     probs = np.zeros((4, M, dom.ny, dom.nx), np.uint8)
-    code = np.full(sh, 1, np.uint8)
-    encode.write_ptype(tmp_path / "p.bin.gz", 6, 3, probs, dom, None, ncep_code=code)
-    e = read_bin(tmp_path / "p.bin.gz")
-    assert e["probs"].shape == (4, M, dom.ny, dom.nx) and (e["ncep"] == 1).all()
-    encode.write_ptype(tmp_path / "p0.bin.gz", 6, 3, probs, dom)                     # older layout stays readable
-    assert "ncep" not in read_bin(tmp_path / "p0.bin.gz")
+    encode.write_ptype(tmp_path / "p.bin.gz", 6, 3, probs, dom)
+    assert read_bin(tmp_path / "p.bin.gz")["probs"].shape == (4, M, dom.ny, dom.nx)
 
 
 # ------------------------------------------------------------------ 2 m temperature gates
@@ -131,12 +120,11 @@ class Weather(Fake):
         probs[:, 0, 0] = [0, 30, 70, 0]                                              # cell (0, 0): the cold-top case
         probs[:, 1, 1] = [0, 0, 100, 0]                                              # cell (1, 1): freezing rain at 2.85 C -> rain
         cp = np.full((NY, NX), 50.0, np.float32); cp[0, 0] = 95.0
-        code = np.full((NY, NX), 0 if fhr == 3 else 1, np.uint8)
         t2 = np.full((NY, NX), 270.0, np.float32); t2[1, 1] = 276.0                  # cell (1, 1) is 2.85 C
-        return {**r, "probs": probs, "cpofp": cp, "ncep": code, "t2": t2}
+        return {**r, "probs": probs, "cpofp": cp, "t2": t2}
 
 
-def test_run_applies_cap_step_average_and_stores_ncep_and_swe(tmp_path):
+def test_run_applies_gate_cap_step_average_and_stores_swe(tmp_path):
     rc, man = go(tmp_path, Weather(), max_fhr=6)
     assert rc == 0
     run = tmp_path / man["base"]
@@ -144,7 +132,6 @@ def test_run_applies_cap_step_average_and_stores_ncep_and_swe(tmp_path):
     assert pt3["probs"][:, 0, 0, 0].tolist() == [0, 95, 5, 0]                        # cap: 70 -> 5, excess 65 -> snow
     assert pt6["probs"][:, 0, 5, 5].tolist() == [0, 100, 0, 0]                       # the map shows the end-of-step type
     assert pt3["probs"][:, 0, 1, 1].tolist() == [100, 0, 0, 0]                       # 2 m temperature gate: too warm for freezing rain
-    assert (pt3["ncep"][:, 3, 3] == 0).all() and (pt6["ncep"][:, 3, 3] == 1).all()
     c3, c6 = read_bin(run / "cum/f003.bin.gz"), read_bin(run / "cum/f006.bin.gz")
     # member 0: 3 mm per 3 h.  f003 is all rain -> no snow; f006 averages rain (start) and snow (end) -> half snow
     assert np.isclose(c3["swe_mm"][0, 5, 5], 0.0) and np.isclose(c6["swe_mm"][0, 5, 5], 1.5, atol=0.02)
@@ -156,7 +143,7 @@ def test_run_applies_cap_step_average_and_stores_ncep_and_swe(tmp_path):
 
 
 class Trace(Weather):
-    """Cell (7, 7) gets a trace of precipitation (0.02 mm per step) while NCEP's flag says rain."""
+    """Cell (7, 7) gets a trace of precipitation (0.02 mm per step), below the wet mask."""
 
     def __call__(self, task):
         r = super().__call__(task)
@@ -165,13 +152,12 @@ class Trace(Weather):
         return r
 
 
-def test_ncep_type_is_dropped_where_the_member_is_dry_by_the_bourgouin_wet_mask(tmp_path):
+def test_trace_precipitation_gets_no_type(tmp_path):
     rc, man = go(tmp_path, Trace(), max_fhr=6)
     assert rc == 0
     pt = read_bin(tmp_path / man["base"] / "ptype/f006.bin.gz")
-    assert (pt["probs"][:, :, 7, 7] == 0).all()                                      # Bourgouin: dry
-    assert (pt["ncep"][:, 7, 7] == C.NCEP_NONE).all()                                # NCEP follows the same mask
-    assert (pt["ncep"][:, 5, 5] == 1).all()                                          # wet cells keep NCEP's type
+    assert (pt["probs"][:, :, 7, 7] == 0).all()                                      # below 0.05 mm per step: dry
+    assert (pt["probs"][1, :, 5, 5] == 100).all()                                    # an ordinary wet cell keeps its type
 
 
 def test_resuming_matches_an_uninterrupted_run_with_the_new_state(tmp_path):

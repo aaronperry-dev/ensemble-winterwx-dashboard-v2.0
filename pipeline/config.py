@@ -81,7 +81,6 @@ SWE_MM_PER_COUNT = 0.02   # uint16 cumulative snow liquid equivalent, any snow r
 CPOFP_CAP_MIN_PCT = 90.0   # the model's liquid-fraction cap on freezing rain applies only where it says at least this % is frozen
 FZRA_MAX_T2_C = 1.0    # freezing rain needs a (near-)freezing surface: above this 2 m temperature its share becomes rain
 PL_MAX_T2_C = 3.0      # ice pellets survive to the surface only in cold air (RAP/HRRR use <= 3 C): above this their share becomes rain
-NCEP_NONE, NCEP_UNKNOWN = 254, 255   # codes in the ptype file's NCEP-type plane (0-3 = RA, SN, FZRA, PL)
 
 # --------------------------------------------------------------------------- data sources
 S3_BASE = "https://noaa-gefs-pds.s3.amazonaws.com"

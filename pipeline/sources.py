@@ -61,9 +61,7 @@ def required_fields(levels=C.PLEVELS) -> list[FieldSpec]:
         FieldSpec("a", "RH", "2 m above ground", "RH2"),
         FieldSpec("a", "PRES", "surface", "PS"),
         FieldSpec("a", "APCP", "surface", "APCP"),
-        # model-side precip-type information; nice to have, never required
-        FieldSpec("a", "CRAIN", "surface", "CRAIN", True), FieldSpec("a", "CSNOW", "surface", "CSNOW", True),
-        FieldSpec("a", "CICEP", "surface", "CICEP", True), FieldSpec("a", "CFRZR", "surface", "CFRZR", True),
+        # model-side percent frozen precipitation (for the freezing-rain cap); nice to have, never required
         FieldSpec("b", "CPOFP", "surface", "CPOFP", True),
     ]
     for lev in levels:

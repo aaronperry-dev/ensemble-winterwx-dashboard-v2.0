@@ -90,16 +90,11 @@ def write_cum(path: Path, fhr: int, step_h: int, qpf_cum_mm: np.ndarray, snow_cu
     return _write_gz(Path(path), _header(KIND_CUM, m, ny, nx, fhr, step_h, domain, tuple(scales), len(parts), mask) + body)
 
 
-def write_ptype(path: Path, fhr: int, step_h: int, probs_u8: np.ndarray, domain: C.Domain, mask: int | None = None,
-                ncep_code: np.ndarray | None = None) -> int:
-    """probs_u8: (4, nmem, ny, nx) Bourgouin percent [RA, SN, FZRA, PL].
-    ncep_code (optional): (nmem, ny, nx) uint8, NCEP's dominant type (0-3, C.NCEP_NONE, C.NCEP_UNKNOWN), stored as a 5th plane."""
+def write_ptype(path: Path, fhr: int, step_h: int, probs_u8: np.ndarray, domain: C.Domain, mask: int | None = None) -> int:
+    """probs_u8: (4, nmem, ny, nx) Bourgouin percent [RA, SN, FZRA, PL]."""
     _, m, ny, nx = probs_u8.shape
     body = np.ascontiguousarray(probs_u8, dtype=np.uint8).tobytes()
-    if ncep_code is not None:
-        body += np.ascontiguousarray(ncep_code, dtype=np.uint8).tobytes()
-    hdr = _header(KIND_PTYPE, m, ny, nx, fhr, step_h, domain, narr=5 if ncep_code is not None else 0,
-                  mask=full_mask(m) if mask is None else mask)
+    hdr = _header(KIND_PTYPE, m, ny, nx, fhr, step_h, domain, mask=full_mask(m) if mask is None else mask)
     return _write_gz(Path(path), hdr + body)
 
 
@@ -125,6 +120,4 @@ def read_bin(path: Path) -> dict:
             out["swe_mm"] = arrs[4].astype(np.float32) * s4
     else:
         out["probs"] = np.frombuffer(raw, np.uint8, 4 * n, off).reshape(4, nmem, ny, nx)
-        if narr >= 5:
-            out["ncep"] = np.frombuffer(raw, np.uint8, n, off + 4 * n).reshape(nmem, ny, nx)
     return out

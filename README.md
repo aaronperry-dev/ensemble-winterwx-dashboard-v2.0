@@ -28,22 +28,21 @@ run is still filling in).
 | Precip type | Wet-bulb profile → melting/refreezing energy → ProbIce, ProbSN, ProbPL, ProbFZRA (Eqs. 2, 7–9). Each member's 3-hr QPF is split among types by probability share |
 | Freezing rain, sleet | Liquid-equivalent accumulations: each step's QPF × the member's freezing-rain (or sleet) share, summed. Not radial ice accretion and not pellet depth |
 | Snowfall | QPF × snow share × SLR / 10 (cm). SLR is **Kuchera** by default (clamped 5–30, 12:1 baseline), or fixed with `--slr-mode fixed:12.5` / the workflow input. The files also store the snow liquid equivalent, so the viewer's **Snow-to-liquid ratio** selector (Kuchera, 13:1, 12:1, 10:1) needs no new data |
-| 2 m temperature gates | Freezing rain becomes rain where 2 m temperature is above +1 °C, and ice pellets become rain above +3 °C (`FZRA_MAX_T2_C`, `PL_MAX_T2_C` in `pipeline/config.py`). 2 m temperature is already downloaded, so there is no extra cost. On one cycle (F024 and F060, 31 members) it removed 13 % of Bourgouin's freezing-rain cells and 31 % of the cells where NCEP says rain |
+| 2 m temperature gates | Freezing rain becomes rain where 2 m temperature is above +1 °C, and ice pellets become rain above +3 °C (`FZRA_MAX_T2_C`, `PL_MAX_T2_C` in `pipeline/config.py`). 2 m temperature is already downloaded, so there is no extra cost. On one cycle (F024 and F060, 31 members) it removed 13 % of Bourgouin's freezing-rain cells; in the ASOS check it left freezing-rain detection unchanged and improved rain accuracy |
 | Freezing-rain cap | GEFS publishes `CPOFP` (percent frozen precipitation). **Only where the model says at least 90 % is frozen** (`CPOFP_CAP_MIN_PCT`), a member's freezing-rain share is capped at (100 − CPOFP)% of its QPF; the excess goes to snow and sleet in proportion to their shares (all to snow if both are zero). Rain is never turned into snow. Below 90 the field did not help when checked against ASOS (see Verification), and a full cap halved freezing-rain detection. If `CPOFP` is missing for a member-hour, no cap is applied |
 | Step-averaged shares | Accumulations (snow, freezing rain, sleet, snow liquid) use the mean of the type shares at the start and end of each 3-hr step, because the QPF fell over the whole step. The precip-type map keeps the end-of-step shares. Where only one end has a type, that end is used |
-| NCEP dominant type | `CRAIN`, `CSNOW`, `CICEP`, `CFRZR` (binary flags at the valid time) are stored per member, tie order freezing rain > snow > sleet > rain. NCEP's type is dropped where the member's 3-hr QPF is under 0.05 mm, the same wet mask Bourgouin uses. They drive the alternate type map, the NCEP probabilities and the Bourgouin-vs-NCEP agreement layer. They are optional: a missing flag leaves the member "unknown" and nothing fails |
 | Heights | Hypsometric integration of virtual temperature, so no height download is needed |
 
 ### Precipitation-type decision tree
 
 Applied to every member at every 3-hour step, in this order. Only fields in the GEFS 0.5° files are used (the 0.25° files have no pressure-level profiles).
 
-1. **Is it precipitating?** Member 3-hr QPF ≥ 0.05 mm. Otherwise no type (both Bourgouin and NCEP's type are blanked, so trace amounts never count as a disagreement).
+1. **Is it precipitating?** Member 3-hr QPF ≥ 0.05 mm. Otherwise no type.
 2. **Profile-based type (Revised Bourgouin).** Wet-bulb profile from the 2 m level and pressure levels → melting and refreezing energy, ice-nucleation probability → % rain, snow, freezing rain, sleet. Surface wet-bulb above 0 °C turns any freezing rain into rain (paper, Appendix c).
 3. **2 m temperature gates** (the last step of the RAP/HRRR tree). Freezing rain needs a surface near freezing: above **+1 °C** its share becomes rain. Ice pellets need cold air: above **+3 °C** their share becomes rain. Snow is not gated, because the melting-energy test already handles it and only about 0.5 % of snow cells are above 3 °C. Where 2 m temperature is missing, no gate applies.
 4. **Model liquid-fraction cap**, only where the model says at least 90 % of the precipitation is frozen (`CPOFP` ≥ 90): freezing rain cannot exceed the liquid fraction it reports (100 − CPOFP). The excess goes to snow and sleet in proportion to their shares. Rain is never converted to snow. Below 90, or where CPOFP is missing, no cap applies.
 5. **Accumulations** (snow, freezing rain, sleet, snow liquid) use the mean of the type shares at the start and end of each step. The type map shows the end-of-step shares.
-6. **Alternate view: NCEP's own dominant type** (four wet-bulb schemes, ties resolved freezing rain > snow > sleet > rain) and the **agreement** layer. These are shown next to Bourgouin and are **not blended into it**. On the ASOS check below the current Bourgouin tree scores slightly better than NCEP's flags for freezing rain (CSI 0.22 vs 0.20) and is more accurate overall (0.873 vs 0.864), but the difference is small and the two disagree mainly on marginal cases, so both are shown.
+6. **NCEP's own dominant-type flags are not used.** They were evaluated against ASOS (below) and Bourgouin scored slightly better for freezing rain (CSI 0.22 vs 0.20; AUC 0.77 vs 0.72) and overall (0.873 vs 0.864). Bourgouin also gives each member fractional type shares, which the QPF split and the type totals need, and it comes from the profile that is already downloaded.
 
 Known limits: Bourgouin's supercooled-liquid branch (cloud tops warmer than about −10 °C, no warm layer) still produces freezing rain at very cold surface temperatures where snow is usually observed (model ZR below −5 °C was observed as snow about 80 % of the time). A simple cold-surface rule fixed that but cost more freezing-rain detection than it saved, so it is left out.
 
@@ -56,7 +55,7 @@ Checked with archived GEFS fields (8 members, 3–24 h leads, 00Z cycles) on the
 | Raw Bourgouin | 0.859 | 0.50 | 0.72 | 0.22 |
 | + 2 m gates (+1 °C) + full CPOFP cap (an earlier version) | 0.876 | 0.24 | 0.70 | 0.16 |
 | **+ 2 m gates + cap only where CPOFP ≥ 90 (current)** | **0.873** | **0.43** | **0.69** | **0.22** |
-| NCEP dominant-type flags | 0.864 | 0.33 | 0.67 | 0.20 |
+| NCEP dominant-type flags (not used) | 0.864 | 0.33 | 0.67 | 0.20 |
 
 * The same ordering holds in the held-out 2025-26 winter (current ZR CSI 0.22 vs NCEP 0.19; full cap 0.15). Bootstrapping over days puts the raw ZR POD at 0.43–0.57 and the full-cap POD at 0.19–0.32 (90 % intervals), so the cap's loss is not noise.
 * Where Bourgouin says freezing rain, ZR was observed 30–33 % of the time for CPOFP below 90 but 17 % at 90 and above, which is why the cap is limited to that range.
@@ -114,7 +113,7 @@ Run the workflow by hand with `force_refresh` = true (or pass `--force`) to down
 `latest.json` lists the run, domain, scales and every step. Each step has two files:
 
 * `cum/fHHH.bin.gz`: **cumulative-since-init** `u16 [member][y][x]` arrays, in order: QPF (0.05 mm per count), snowfall (0.1 cm), freezing rain (0.01 mm liquid equivalent), sleet (0.01 mm liquid equivalent), snow liquid equivalent (0.02 mm, the fifth array). The header's `narr` byte gives the array count, so older 2- and 4-array files still read; the fifth scale sits at header offset 52.
-* `ptype/fHHH.bin.gz`: `u8 [4][member][y][x]` = % RA, SN, FZRA, PL (0 where the member's 3-hr QPF is below 0.05 mm). When `narr` is 5 a fifth plane `u8 [member][y][x]` holds NCEP's dominant type (0 RA, 1 SN, 2 FZRA, 3 PL, 254 none, 255 unknown). Each step in `latest.json` carries `"ncep": true` when that plane is present.
+* `ptype/fHHH.bin.gz`: `u8 [4][member][y][x]` = % RA, SN, FZRA, PL (0 where the member's 3-hr QPF is below 0.05 mm).
 
 Cumulative storage means any rolling 3/6/12/24/48-hour total is just `cum(t) − cum(t−w)`, two small files fetched
 by the browser. A full run is about 25 MB. Domain: 60–20°N, 135–50°W, 0.5° (81 × 171). The 64-byte `GWX1` header is
@@ -129,7 +128,7 @@ documented in `pipeline/encode.py`.
   * **Min, P5, P10, P25, P50, Mean, P75, P90, P95, Max.** Percentiles interpolate linearly between ranked members (31 members, so P5 sits between the 2nd and 3rd lowest).
   * **PMM**, the probability-matched mean (Ebert 2001). The ensemble mean supplies the spatial pattern. All member values pooled over the whole map are ranked, and every 31st value is dealt back onto the mean field by rank. Amplitudes are no longer smoothed away, and the map-wide total stays close to the mean's.
   * **LPMM**, the local probability-matched mean (Clark 2017; Snook et al. 2019/2020). The same matching is done independently in a square neighborhood around each grid cell, which avoids mixing very different regimes (a coastal low and a dry interior). The neighborhood is selectable (±1° to ±4°; default ±2°, about 140 miles). Published LPM settings are tuned for 3-km convection-allowing ensembles, so treat the default as a starting point for 0.5° GEFS. Cells whose ensemble mean is zero stay zero.
-  * Precip type has three views: **Revised Bourgouin** (most likely type and per-type probability), **NCEP dominant type** (same two views) and **Agreement**, the share of members naming the same type among those where both methods name one. The tooltip lists both sets of member counts and how many members agree.
+  * Precip type has two views: the most likely type (QPF-weighted) and the per-type probability (% of members). The tooltip lists member counts for each type and the mean Bourgouin probabilities.
   * Snowfall has a ratio selector (Kuchera, 13:1, 12:1, 10:1) that rescales from the stored snow liquid equivalent and is kept in the URL (`slr=`). Files from before this change lack that array, and the selector stays hidden.
   * Probability of at least *x*, and any single member. Everything in the viewer is shown in imperial units: inches for QPF, snowfall, freezing rain and sleet, and miles/feet on the scale bar. (The data files keep mm/cm internally; conversion happens in the browser.)
   * The PMM/LPMM math is in `ensstats.js` and tested with `node --test tests/ensstats.test.js` (distribution matching, rank order, equality with PMM for a map-sized window, brute-force comparison).

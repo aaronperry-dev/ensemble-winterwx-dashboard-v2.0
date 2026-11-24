@@ -23,9 +23,7 @@ function src(kind) {
   return { key: P.key, scale: P.scale, perIn: P.si === 'cm' ? CM_PER_IN : MM_PER_IN };
 }
 const siPerIn = (kind) => src(kind).perIn;
-const isProb = (s) => s.startsWith('prob:') || s.startsWith('nprob:') || s === 'agree';       // map shows a percentage
-const AGREE = { edges: [0.01, 20, 40, 60, 80, 99.9], colors: ['#7f2704', '#d94801', '#fd8d3c', '#fdd0a2', '#9ecae1', '#3182bd'],
-  labels: ['0\u201320%', '20\u201340%', '40\u201360%', '60\u201380%', '80\u201399%', '100%'], prob: true, title: 'Bourgouin vs NCEP type (% of members agreeing)' };
+const isProb = (s) => s.startsWith('prob:');       // map shows a percentage
 const PROB_RAMP = {
   qpf: ['#e5f5e0', '#c7e9c0', '#a1d99b', '#74c476', '#41ab5d', '#31a353', '#238b45', '#006d2c', '#00441b'],
   snow: ['#deebf7', '#c6dbef', '#bdd7e7', '#9ecae1', '#6baed6', '#4292c6', '#3182bd', '#08519c', '#082694'],
@@ -72,9 +70,7 @@ async function fetchBin(url) {
       const o = { h }; ['q', 's', 'z', 'p', 'w'].slice(0, h.narr).forEach((k, i) => { o[k] = new Uint16Array(buf, 64 + 2 * n * i, n); });
       return o;
     }
-    const o = { h, p: new Uint8Array(buf, 64, 4 * n) };
-    if (dv.getUint8(5) >= 5) o.n = new Uint8Array(buf, 64 + 4 * n, n);       // NCEP's own dominant type per member (0-3, 254 none, 255 unknown)
-    return o;
+    return { h, p: new Uint8Array(buf, 64, 4 * n) };
   });
 }
 const loadCum = (fhr) => fetchBin(S.base + S.byFhr.get(fhr).cum);
@@ -161,15 +157,12 @@ async function ptypeData() {
   const pt = await loadPtype(st.fhr), qw = await windowValues('qpf', S.idx, 'step', pt.h.mask);
   const M = qw.members.length, N = pt.h.ny * pt.h.nx, full = pt.h.nmem * N, p = new Uint8Array(4 * M * N);
   for (let t = 0; t < 4; t++) qw.members.forEach((m, j) => p.set(pt.p.subarray(t * full + m * N, t * full + (m + 1) * N), t * M * N + j * N));
-  let n = null;
-  if (pt.n) { n = new Uint8Array(M * N); qw.members.forEach((m, j) => n.set(pt.n.subarray(m * N, (m + 1) * N), j * N)); }
-  return { p, n, q: qw.data, h: { ...pt.h, nmem: M }, w: qw.w, members: qw.members };
+  return { p, q: qw.data, h: { ...pt.h, nmem: M }, w: qw.w, members: qw.members };
 }
 
 function buildPtype(d, stat) {
   if (isMem(stat) && !d.members.includes(+stat.slice(1))) stat = 'ens';
-  if (!d.n && (stat === 'ens-n' || stat === 'agree' || stat.startsWith('nprob:'))) stat = 'ens';      // this hour has no NCEP flags
-  const { p, n: ncep, q, h, w } = d, M = h.nmem, N = h.ny * h.nx, rateDiv = w.hours || 3;
+  const { p, q, h, w } = d, M = h.nmem, N = h.ny * h.nx, rateDiv = w.hours || 3;
   const field = new Float32Array(N), types = new Float32Array(N), tot = M * N;
   const share = (m, i, t) => { let s = 0; for (let k = 0; k < 4; k++) s += p[k * tot + m * N + i]; return s ? p[t * tot + m * N + i] / s : 0; };
   for (let i = 0; i < N; i++) {
@@ -180,23 +173,6 @@ function buildPtype(d, stat) {
       const want = +stat.slice(5); let k = 0;
       for (let m = 0; m < M; m++) if (domType(p, N, m, i) === want) k++;
       field[i] = (100 * k) / M; types[i] = want;
-    } else if (stat.startsWith('nprob:')) {               // NCEP's dominant type: share of members (that have it) with this type
-      const want = +stat.slice(6); let k = 0, known = 0;
-      for (let m = 0; m < M; m++) { const b = ncep[m * N + i]; if (b === 255) continue; known++; if (b === want) k++; }
-      field[i] = known ? (100 * k) / known : 0; types[i] = want;
-    } else if (stat === 'agree') {                        // of members where BOTH methods name a type, the share naming the same one
-      let both = 0, tot2 = 0;
-      for (let m = 0; m < M; m++) {
-        const a = domType(p, N, m, i), b = ncep[m * N + i];
-        if (a < 0 || b > 3) continue;                     // one method has no type here (dry, or NCEP flag not set at this hour): not a type disagreement
-        tot2++; if (a === b) both++;
-      }
-      field[i] = tot2 ? (100 * both) / tot2 : 0; types[i] = 0;
-    } else if (stat === 'ens-n') {                        // NCEP dominant type, weighted by each member's QPF
-      const wsum = [0, 0, 0, 0]; let qs = 0;
-      for (let m = 0; m < M; m++) { const qq = q[m * N + i], b = ncep[m * N + i]; qs += qq; if (b < 4 && qq > 0) wsum[b] += qq; }
-      let best = -1, bv = 0; for (const t of TIE_ORDER) if (wsum[t] > bv) { bv = wsum[t]; best = t; }
-      if (best >= 0) { field[i] = dbzOf(qs / M / rateDiv, best); types[i] = best; }
     } else {                                              // 'ens': QPF-weighted dominant type, mean-QPF intensity
       const wsum = [0, 0, 0, 0]; let qs = 0;
       for (let m = 0; m < M; m++) { const qq = q[m * N + i]; qs += qq; if (qq > 0) for (let t = 0; t < 4; t++) wsum[t] += qq * share(m, i, t); }
@@ -209,7 +185,6 @@ function buildPtype(d, stat) {
 
 /* ============================================================================= rendering */
 function classesFor() {
-  if (S.stat === 'agree') return AGREE;
   if (isProb(S.stat)) {
     const k = PROB_RAMP[S.product] || ptypeProbColors(S.product === 'zr' ? 2 : S.product === 'pl' ? 3 : +S.stat.split(':')[1]);
     return { edges: PROB_EDGES, colors: k, labels: PROB_EDGES.map((e) => `${e}%+`), prob: true };
@@ -281,13 +256,10 @@ function statName() {
   if (s === 'pmm') return 'Probability-matched mean (PMM)';
   if (s === 'lpmm') return `Local prob.-matched mean (LPMM \u00b1${lpmmMi()} mi)`;
   if (EnsStats.isPct(s)) return s === 'p50' ? '50th percentile (median)' : `${s.slice(1)}th percentile`;
-  if (s === 'ens') return 'Most likely type (Revised Bourgouin)';
-  if (s === 'ens-n') return 'Most likely type (NCEP dominant type)';
-  if (s === 'agree') return 'Agreement between Bourgouin and NCEP types';
-  if (s.startsWith('nprob:')) return `NCEP: probability of ${PTYPE.long[+s.slice(6)].toLowerCase()}`;
+  if (s === 'ens') return 'Most likely type (ensemble)';
   if (s.startsWith('prob:')) {
     const v = +s.slice(5);
-    return S.product === 'ptype' ? `Bourgouin: probability of ${PTYPE.long[v].toLowerCase()}` : `Probability ≥ ${v}″`;
+    return S.product === 'ptype' ? `Probability of ${PTYPE.long[v].toLowerCase()}` : `Probability ≥ ${v}″`;
   }
   const m = +s.slice(1); return m === 0 ? 'Control (c00)' : `Member p${pad(m, 2)}`;
 }
@@ -335,7 +307,7 @@ function updateLegend() {
     note.textContent = 'dBZ ≈ rate from 3-hr QPF (rain/ice: Z=200R^1.6, snow: Z=1780R^2.21)'; el.appendChild(note); return;
   }
   const c = classesFor();
-  hdr.textContent = c.title && c.prob ? c.title : c.prob ? `Probability (% of ${stepN(S.idx)} members)` :
+  hdr.textContent = c.prob ? `Probability (% of ${stepN(S.idx)} members)` :
     `${c.title} (in)`;
   for (let i = c.colors.length - 1; i >= 0; i--) {
     const row = document.createElement('div'); row.className = 'lg-row';
@@ -430,17 +402,6 @@ function ptypeTip(ll, d) {
   h2 += `<div class="tip-grid"><span>Members with precip</span><b>${wet} / ${M}</b><span>Mean 3-hr QPF</span><b>${fmtVal('qpf', qm / MM_PER_IN)}</b></div>`;
   h2 += '<div class="tip-s">Dominant type (members)</div><div class="tip-p">';
   order.forEach((t) => { h2 += `<span><i class="sw" style="background:${PTYPE.ramps[PTYPE.names[t]][18]}"></i>${PTYPE.long[t]}</span><i><u style="width:${(100 * cnt[t]) / M}%"></u></i><b>${cnt[t]}</b>`; });
-  if (d.n) {
-    const nc = [0, 0, 0, 0]; let known = 0, agree = 0, either = 0;
-    for (let m = 0; m < M; m++) {
-      const b = d.n[m * N + i], a = domType(p, N, m, i); if (b === 255) continue;
-      known++; if (b < 4) nc[b]++;
-      if (a >= 0 && b < 4) { either++; if (a === b) agree++; }
-    }
-    h2 += '</div><div class="tip-s">NCEP dominant type (members)</div><div class="tip-p">';
-    order.forEach((t) => { h2 += `<span><i class="sw" style="background:${PTYPE.ramps[PTYPE.names[t]][18]}"></i>${PTYPE.long[t]}</span><i><u style="width:${known ? (100 * nc[t]) / known : 0}%"></u></i><b>${nc[t]}</b>`; });
-    h2 += `</div><div class="tip-grid"><span>Methods agree</span><b>${agree} / ${either}</b></div><div class="tip-p">`;
-  }
   h2 += '</div><div class="tip-s">Mean Bourgouin probability (wet members)</div><div class="tip-grid">';
   order.forEach((t) => { h2 += `<span>${PTYPE.long[t]}</span><b>${wet ? Math.round(avg[t] / wet) : 0}%</b>`; });
   return h2 + '</div>';
@@ -482,10 +443,8 @@ function statOptions() {
   const M = S.man.members, opts = [];
   const g = (label, items) => opts.push(`<optgroup label="${label}">${items.map(([v, t]) => `<option value="${v}">${t}</option>`).join('')}</optgroup>`);
   if (S.product === 'ptype') {
-    const nc = !!S.steps[S.idx].ncep;                // NCEP's own flags are in this hour's file
-    g('Ensemble', [['ens', 'Most likely type: Revised Bourgouin'], ...(nc ? [['ens-n', 'Most likely type: NCEP dominant type'], ['agree', 'Agreement: Bourgouin vs NCEP']] : [])]);
-    g('Probability of type: Revised Bourgouin', PTYPE.names.map((n, t) => [`prob:${t}`, `${PTYPE.long[t]} (% of members)`]));
-    if (nc) g('Probability of type: NCEP dominant', PTYPE.names.map((n, t) => [`nprob:${t}`, `${PTYPE.long[t]} (% of members)`]));
+    g('Ensemble', [['ens', 'Most likely type (QPF-weighted)']]);
+    g('Probability of type', PTYPE.names.map((n, t) => [`prob:${t}`, `${PTYPE.long[t]} (% of members)`]));
   } else {
     g('Ensemble statistics', [['min', 'Minimum'], ['p5', '5th percentile'], ['p10', '10th percentile'], ['p25', '25th percentile'], ['p50', '50th percentile (median)'],
       ['mean', 'Mean'], ['p75', '75th percentile'], ['p90', '90th percentile'], ['p95', '95th percentile'], ['max', 'Maximum']]);
@@ -505,9 +464,7 @@ function syncControls() {
   $('#lpmm-wrap').hidden = S.stat !== 'lpmm'; $('#lpmm-r').value = String(S.lpmmR);
   $('#slr-wrap').hidden = !(S.product === 'snow' && S.hasSwe); $('#slr').value = S.slr;
   const help = { pmm: 'Ensemble-mean pattern with amplitudes re-assigned from all members pooled over the whole map, so peaks are not smoothed away.',
-    lpmm: `Same matching done separately inside a \u00b1${lpmmMi()}-mile neighborhood around each point: keeps local detail and avoids mixing different weather regimes.`,
-    'ens-n': 'The type NCEP\u2019s own post-processor picked for each member (dominant of four wet-bulb schemes), weighted by QPF.',
-    agree: 'Of the members where both Revised Bourgouin and NCEP name a type, the share naming the same one. Low values mark places where the type depends on the method.' }[S.stat];
+    lpmm: `Same matching done separately inside a \u00b1${lpmmMi()}-mile neighborhood around each point: keeps local detail and avoids mixing different weather regimes.` }[S.stat];
   $('#stat-help').textContent = help || ''; $('#stat-help').hidden = !help;
   document.querySelectorAll('#product button').forEach((b) => b.classList.toggle('on', b.dataset.v === S.product));
   document.querySelectorAll('#period button').forEach((b) => { b.classList.toggle('on', String(b.dataset.v) === String(S.period)); b.disabled = S.product === 'ptype' && b.dataset.v !== 'step'; });
