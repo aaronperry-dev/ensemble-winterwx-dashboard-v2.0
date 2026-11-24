@@ -75,6 +75,8 @@ SLR_MIN, SLR_MAX = 5.0, 30.0
 # --------------------------------------------------------------------------- binary quantization
 QPF_MM_PER_COUNT = 0.05   # uint16 cumulative liquid-equivalent  (max 3276 mm)
 SNOW_CM_PER_COUNT = 0.1   # uint16 cumulative snowfall            (max 6553 cm)
+ZR_MM_PER_COUNT = 0.01    # uint16 cumulative freezing-rain liquid equivalent (max 655 mm)
+PL_MM_PER_COUNT = 0.01    # uint16 cumulative sleet / ice-pellet liquid equivalent (max 655 mm)
 
 # --------------------------------------------------------------------------- data sources
 S3_BASE = "https://noaa-gefs-pds.s3.amazonaws.com"

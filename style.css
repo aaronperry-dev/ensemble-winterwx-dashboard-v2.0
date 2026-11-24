@@ -124,3 +124,5 @@ details p { margin: 8px 0; line-height: 1.4; } .fine { font-size: 11px; color: v
 .tip-map b { font-size: 15px; font-variant-numeric: tabular-nums; }
 #lpmm-wrap .lbl { margin-top: 8px; }
 #stat-help { margin: 6px 0 0; line-height: 1.35; }
+
+#product button { flex: 1 1 30%; white-space: nowrap; padding-left: 4px; padding-right: 4px; font-size: 12.5px; }

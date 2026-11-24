@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>GEFS Ensemble Winter Weather — QPF · Snowfall · Precipitation Type</title>
-<meta name="description" content="31-member GEFS ensemble QPF, snowfall and Revised Bourgouin precipitation type with rolling 3/6/12/24/48-hour accumulations.">
+<title>GEFS Ensemble Winter Weather — QPF · Snow · Ice · Precipitation Type</title>
+<meta name="description" content="31-member GEFS ensemble QPF, snowfall, freezing rain, sleet and Revised Bourgouin precipitation type with rolling 3/6/12/24/48-hour accumulations, 10 days out.">
 <link rel="stylesheet" href="maplibre-gl.css">
 <link rel="stylesheet" href="style.css">
 </head>
@@ -22,7 +22,7 @@
 
 <aside id="panel" aria-label="Controls">
   <h1>GEFS Winter Weather</h1>
-  <p class="sub">31-member ensemble &middot; QPF &middot; snowfall &middot; precip type</p>
+  <p class="sub">31-member ensemble &middot; QPF &middot; snow &middot; ice &middot; type</p>
 
   <label class="lbl">Product</label>
   <div id="product" class="seg"></div>
@@ -64,6 +64,7 @@
     <summary>Method &amp; data</summary>
     <p><b>Precip type</b> uses the Revised Bourgouin algorithm (Birk et&nbsp;al. 2021, <i>Wea. Forecasting</i>) on each member's wet-bulb profile; its four probabilities (rain, snow, freezing rain, sleet) split that member's QPF.</p>
     <p><b>Snowfall</b> = 3-hr QPF &times; snow share &times; snow-to-liquid ratio (Kuchera: warmest temperature surface&ndash;500&nbsp;hPa), summed over the period.</p>
+    <p><b>Freezing rain</b> and <b>sleet</b> are the liquid-equivalent part of each member's QPF that the Bourgouin probabilities assign to that type. Freezing rain is not radial ice accretion (no wind, surface or icing-efficiency adjustment); sleet is liquid, not pellet depth.</p>
     <p><b>Statistics</b> are computed per grid cell from the 31 member totals (percentiles interpolate between ranked members). <b>PMM</b> (Ebert 2001) keeps the ensemble-mean pattern but takes its amplitudes from all members pooled over the map; <b>LPMM</b> (Clark 2017; Snook et&nbsp;al.) does the same inside a neighborhood around each point.</p>
     <p><b>Periods</b> are rolling windows ending at the selected hour. Before the window fits in the run, the total since initialization is shown.</p>
     <p>Hover (desktop) or tap (phone) the map for the ensemble breakdown at that point. Click to pin.</p>

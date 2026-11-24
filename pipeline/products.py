@@ -44,3 +44,12 @@ def snowfall_step_cm(qpf_mm: np.ndarray, probs: np.ndarray, slr: np.ndarray) -> 
     """Snowfall (cm) for one step: QPF x snow share x snow-to-liquid ratio / 10 (mm -> cm)."""
     share_sn = type_shares(probs)[1]
     return (qpf_mm * share_sn * slr / 10.0).astype(np.float32)
+
+
+def type_qpf_step_mm(qpf_mm: np.ndarray, probs: np.ndarray) -> np.ndarray:
+    """Liquid-equivalent precipitation (mm) of each type for one step: QPF x type share.
+
+    probs (4, M, ny, nx) in percent [RA, SN, FZRA, PL]  ->  (4, M, ny, nx) mm.  The four parts sum to QPF
+    wherever any type probability is non-zero.
+    """
+    return (type_shares(probs) * qpf_mm[None]).astype(np.float32)

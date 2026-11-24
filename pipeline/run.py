@@ -26,7 +26,7 @@ from . import config as C
 from . import encode
 from .http import HttpClient, NotAvailable, SourceError
 from .member import compute_member_step, fetch_fields
-from .products import ApcpAccumulator, snowfall_step_cm
+from .products import ApcpAccumulator, snowfall_step_cm, type_qpf_step_mm
 from .ratelimit import build_gates
 from .sources import SourceChain, Target
 
@@ -104,7 +104,7 @@ def run(args) -> int:
     ex = cf.ProcessPoolExecutor(max_workers=args.workers, initializer=init_worker, initargs=(cfg,))
 
     acc = ApcpAccumulator(len(members), domain.ny, domain.nx)
-    cum_snow = np.zeros((len(members), domain.ny, domain.nx), np.float32)
+    cum_x = {k: np.zeros((len(members), domain.ny, domain.nx), np.float32) for k in ("snow", "zr", "pl")}
     steps: list[dict] = []
     src_counts: dict[str, int] = {}
     total_bytes = 0
@@ -129,7 +129,9 @@ def run(args) -> int:
             "init": cyc.strftime("%Y-%m-%dT%H:%M:%SZ"), "run": run_id, "base": f"{run_id}/",
             "complete": complete, "members": members, "domain": domain.to_dict(),
             "ptype_order": ["RA", "SN", "FZRA", "PL"],
-            "scales": {"qpf_mm_per_count": C.QPF_MM_PER_COUNT, "snow_cm_per_count": C.SNOW_CM_PER_COUNT},
+            "products": ["qpf", "snow", "zr", "pl", "ptype"],
+            "scales": {"qpf_mm_per_count": C.QPF_MM_PER_COUNT, "snow_cm_per_count": C.SNOW_CM_PER_COUNT,
+                       "zr_mm_per_count": C.ZR_MM_PER_COUNT, "pl_mm_per_count": C.PL_MM_PER_COUNT},
             "slr_mode": args.slr_mode, "min_precip_mm": C.MIN_PRECIP_MM,
             "sources_used": src_counts, "steps": steps,
         }
@@ -176,7 +178,7 @@ def run(args) -> int:
             st = state[fhr]
             if len(st["res"]) == len(members):
                 total_bytes += finalize_step(fhr, fhrs[head - 1] if head else 0, members, st["res"], acc,
-                                             cum_snow, run_dir, domain, steps, cyc)
+                                             cum_x, run_dir, domain, steps, cyc)
                 state[fhr] = {"res": {}, "err": {}}
                 write_manifest(False)
                 log.info("f%03d done (%d/%d)  %.0fs elapsed", fhr, head + 1, len(fhrs), time.time() - t_start)
@@ -197,7 +199,7 @@ def run(args) -> int:
     return 0 if steps else 2
 
 
-def finalize_step(fhr, prev_fhr, members, res, acc, cum_snow, run_dir, domain, steps, cyc) -> int:
+def finalize_step(fhr, prev_fhr, members, res, acc, cum_x, run_dir, domain, steps, cyc) -> int:
     windows = {tuple(res[m]["window"]) for m in members}
     if len(windows) != 1:
         raise SourceError(f"members disagree on APCP window at f{fhr:03d}: {windows}")
@@ -209,10 +211,14 @@ def finalize_step(fhr, prev_fhr, members, res, acc, cum_snow, run_dir, domain, s
     wet = qpf >= C.MIN_PRECIP_MM
     probs = (probs * wet[None]).astype(np.uint8)
     snow = snowfall_step_cm(qpf, probs, slr)
-    cum_snow += snow
+    cum_x["snow"] += snow
+    by_type = type_qpf_step_mm(qpf, probs)                                # (4, M, ny, nx) mm liquid-equivalent
+    cum_x["zr"] += by_type[2]
+    cum_x["pl"] += by_type[3]
     for k in [k for k in acc.cum if k < fhr - 24]:
         del acc.cum[k]
-    n = encode.write_cum(run_dir / "cum" / f"f{fhr:03d}.bin.gz", fhr, fhr - prev_fhr, acc.cum[fhr], cum_snow, domain)
+    n = encode.write_cum(run_dir / "cum" / f"f{fhr:03d}.bin.gz", fhr, fhr - prev_fhr, acc.cum[fhr], cum_x["snow"], domain,
+                         cum_x["zr"], cum_x["pl"])
     n += encode.write_ptype(run_dir / "ptype" / f"f{fhr:03d}.bin.gz", fhr, fhr - prev_fhr, probs, domain)
     steps.append({
         "fhr": fhr, "step_h": fhr - prev_fhr,

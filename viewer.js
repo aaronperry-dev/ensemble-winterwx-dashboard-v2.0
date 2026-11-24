@@ -9,7 +9,12 @@ const isMem = (s) => /^m\d+$/.test(s);
 const MM_PER_IN = 25.4, CM_PER_IN = 2.54;
 const TIE_ORDER = [2, 3, 1, 0];            // FZRA > PL > SN > RA  (indices into RA, SN, FZRA, PL)
 const PERIODS = [['step', '3 hr'], [6, '6 hr'], [12, '12 hr'], [24, '24 hr'], [48, '48 hr']];
-const PROB_THRESH = { qpf: [0.01, 0.10, 0.25, 0.50, 1.00, 2.00], snow: [1, 3, 6, 12, 18, 24] };   // inches
+const PROB_THRESH = { qpf: [0.01, 0.10, 0.25, 0.50, 1.00, 2.00], snow: [1, 3, 6, 12, 18, 24],
+  zr: [0.01, 0.05, 0.10, 0.25, 0.50, 1.00], pl: [0.01, 0.05, 0.10, 0.25, 0.50, 1.00] };   // inches
+/* Accumulation products: array key in the cumulative file, header scale slot, and SI unit. Snowfall is in cm; the rest are mm of liquid. */
+const PRODUCTS = { qpf: { name: 'QPF', key: 'q', scale: 's0', si: 'mm' }, snow: { name: 'Snowfall', key: 's', scale: 's1', si: 'cm' },
+  zr: { name: 'Freezing rain', key: 'z', scale: 's2', si: 'mm' }, pl: { name: 'Sleet', key: 'p', scale: 's3', si: 'mm' } };
+const siPerIn = (kind) => (PRODUCTS[kind].si === 'cm' ? CM_PER_IN : MM_PER_IN);
 const PROB_RAMP = {
   qpf: ['#e5f5e0', '#c7e9c0', '#a1d99b', '#74c476', '#41ab5d', '#31a353', '#238b45', '#006d2c', '#00441b'],
   snow: ['#deebf7', '#c6dbef', '#bdd7e7', '#9ecae1', '#6baed6', '#4292c6', '#3182bd', '#08519c', '#082694'],
@@ -43,10 +48,14 @@ async function fetchBin(url) {
       buf = await new Response(new Blob([buf]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer();
     }
     const dv = new DataView(buf);
-    const h = { kind: dv.getUint8(4), nmem: dv.getUint16(6, true), ny: dv.getUint16(8, true), nx: dv.getUint16(10, true),
-      fhr: dv.getUint16(12, true), stepH: dv.getUint16(14, true), s0: dv.getFloat32(32, true), s1: dv.getFloat32(36, true) };
+    const h = { kind: dv.getUint8(4), narr: dv.getUint8(5) || 2, nmem: dv.getUint16(6, true), ny: dv.getUint16(8, true), nx: dv.getUint16(10, true),
+      fhr: dv.getUint16(12, true), stepH: dv.getUint16(14, true), s0: dv.getFloat32(32, true), s1: dv.getFloat32(36, true),
+      s2: dv.getFloat32(40, true), s3: dv.getFloat32(44, true) };
     const n = h.nmem * h.ny * h.nx;
-    if (h.kind === 1) return { h, q: new Uint16Array(buf, 64, n), s: new Uint16Array(buf, 64 + 2 * n, n) };
+    if (h.kind === 1) {
+      const o = { h }; ['q', 's', 'z', 'p'].slice(0, h.narr).forEach((k, i) => { o[k] = new Uint16Array(buf, 64 + 2 * n * i, n); });
+      return o;
+    }
     return { h, p: new Uint8Array(buf, 64, 4 * n) };
   });
 }
@@ -63,22 +72,23 @@ function windowFor(i, period) {
 
 /** Member totals over the window, raw units (mm for QPF, cm for snow). Float32Array(M*N). */
 async function windowValues(kind, i, period) {
-  const w = windowFor(i, period), key = kind === 'qpf' ? 'q' : 's';
+  const w = windowFor(i, period), key = PRODUCTS[kind].key;
   const [a, b] = await Promise.all([loadCum(w.end), w.start > 0 ? loadCum(w.start) : null]);
-  const scale = kind === 'qpf' ? a.h.s0 : a.h.s1, n = a[key].length, out = new Float32Array(n), A = a[key];
+  if (!a[key]) throw new Error(`${PRODUCTS[kind].name} is not in this run's files yet (the next pipeline run adds it)`);
+  const scale = a.h[PRODUCTS[kind].scale], n = a[key].length, out = new Float32Array(n), A = a[key];
   if (b) { const B = b[key]; for (let k = 0; k < n; k++) out[k] = Math.max(0, A[k] - B[k]) * scale; }
   else for (let k = 0; k < n; k++) out[k] = A[k] * scale;
   return { data: out, w, h: a.h };
 }
 
-const toDisp = (kind, v) => (kind === 'qpf' ? v / MM_PER_IN : v / CM_PER_IN);   // raw -> inches
+const toDisp = (kind, v) => v / siPerIn(kind);   // raw (mm or cm) -> inches
 
 const pct = EnsStats.percentile;
 const FIELD_MEMO = new Map();          // PMM / LPMM fields are the expensive ones: keep the last few
 
 /** One display-unit (inches) field from the member totals of a window. */
 function reduceStat(kind, win, stat) {
-  const { nmem: M, ny, nx } = win.h, N = ny * nx, data = win.data, c = kind === 'qpf' ? 1 / MM_PER_IN : 1 / CM_PER_IN;
+  const { nmem: M, ny, nx } = win.h, N = ny * nx, data = win.data, c = 1 / siPerIn(kind);
   if (isMem(stat)) { const out = new Float32Array(N), o = +stat.slice(1) * N; for (let i = 0; i < N; i++) out[i] = data[o + i] * c; return out; }
   if (stat.startsWith('prob:')) {
     const out = new Float32Array(N), thr = (+stat.slice(5)) / c;                 // inches -> raw
@@ -133,8 +143,8 @@ function buildPtype(d, stat) {
 /* ============================================================================= rendering */
 function classesFor() {
   if (S.stat.startsWith('prob:')) {
-    const k = S.product === 'ptype' ? null : PROB_RAMP[S.product];
-    return { edges: PROB_EDGES, colors: k || ptypeProbColors(+S.stat.slice(5)), labels: PROB_EDGES.map((e) => `${e}%+`), prob: true };
+    const k = PROB_RAMP[S.product] || ptypeProbColors(S.product === 'zr' ? 2 : S.product === 'pl' ? 3 : +S.stat.slice(5));
+    return { edges: PROB_EDGES, colors: k, labels: PROB_EDGES.map((e) => `${e}%+`), prob: true };
   }
   return RAMPS[S.product];
 }
@@ -176,7 +186,7 @@ const pad = (n, w = 3) => String(n).padStart(w, '0');
 
 function productName() {
   if (S.product === 'ptype') return 'Precipitation type';
-  const nm = S.product === 'qpf' ? 'QPF' : 'Snowfall';
+  const nm = PRODUCTS[S.product].name;
   const w = windowFor(S.idx, S.period);
   return `${w.since ? `${w.hours}-hr (since init)` : `${w.hours}-hr`} ${nm}`;
 }
@@ -211,9 +221,10 @@ function updateTitle() {
 
 function fmtEdge(v, kind) {
   if (S.units === 'in') return null;
-  const x = kind === 'qpf' ? v * MM_PER_IN : v * CM_PER_IN;
-  return x < 10 ? x.toFixed(1) : Math.round(x);
+  const x = v * siPerIn(kind);
+  return x < 10 ? x.toFixed(x < 1 ? 2 : 1) : Math.round(x);
 }
+const fmtEdge2b = (t, kind) => `${fmtEdge(t, kind) ?? t} ${PRODUCTS[kind].si}`;
 
 function updateLegend() {
   const el = $('#legend-body'); el.innerHTML = '';
@@ -236,7 +247,7 @@ function updateLegend() {
   const c = classesFor();
   const kind = S.product === 'ptype' ? 'ptype' : S.product;
   hdr.textContent = c.prob ? `Probability (% of ${S.man.members.length} members)` :
-    `${c.title} (${S.units === 'in' ? 'in' : S.product === 'qpf' ? 'mm' : 'cm'})`;
+    `${c.title} (${S.units === 'in' ? 'in' : PRODUCTS[S.product].si})`;
   for (let i = c.colors.length - 1; i >= 0; i--) {
     const row = document.createElement('div'); row.className = 'lg-row';
     let label = c.labels[i];
@@ -275,8 +286,8 @@ function placeName(pt) {
 
 const fmtVal = (kind, inches) => {
   if (S.units === 'in') return `${inches < 0.1 && inches > 0 ? inches.toFixed(3) : inches.toFixed(inches < 10 ? 2 : 1)}″`;
-  const x = kind === 'qpf' ? inches * MM_PER_IN : inches * CM_PER_IN;
-  return `${x < 10 ? x.toFixed(1) : Math.round(x)} ${kind === 'qpf' ? 'mm' : 'cm'}`;
+  const x = inches * siPerIn(kind);
+  return `${x < 10 ? x.toFixed(x < 1 ? 2 : 1) : Math.round(x)} ${PRODUCTS[kind].si}`;
 };
 
 function stripSVG(vals, mean, med, kind, selected) {
@@ -317,7 +328,7 @@ function tipHTML(ll, pt) {
   h += '</div><div class="tip-s">Chance of at least</div><div class="tip-p">';
   PROB_THRESH[kind].forEach((t) => {
     const p = Math.round((100 * vals.filter((v) => v >= t).length) / M);
-    const lab = S.units === 'in' ? `${t}″` : `${fmtEdge(t, kind)} ${kind === 'qpf' ? 'mm' : 'cm'}`;
+    const lab = S.units === 'in' ? `${t}″` : `${fmtEdge2b(t, kind)}`;
     h += `<span>${lab}</span><i><u style="width:${p}%"></u></i><b>${p}%</b>`;
   });
   h += `</div><div class="tip-s">All ${M} members <span class="key"><i class="k1"></i>mean <i class="k2"></i>median</span></div>${stripSVG(vals, mean, med, kind, sel)}`;
@@ -391,7 +402,7 @@ function statOptions() {
   g('Single member', M.map((m, k) => [`m${k}`, k === 0 ? 'Control (c00)' : `Member ${m}`]));
   return opts.join('');
 }
-const fmtEdge2 = (t) => (S.product === 'qpf' ? `${(t * MM_PER_IN).toFixed(t < 0.1 ? 1 : 0)} mm` : `${Math.round(t * CM_PER_IN)} cm`);
+const fmtEdge2 = (t) => { const x = t * siPerIn(S.product); return `${x < 10 ? x.toFixed(x < 1 ? 2 : 1) : Math.round(x)} ${PRODUCTS[S.product].si}`; };
 
 function syncControls() {
   $('#stat').innerHTML = statOptions();
@@ -409,7 +420,8 @@ function syncControls() {
 }
 
 function buildUI() {
-  $('#product').innerHTML = [['qpf', 'QPF'], ['snow', 'Snowfall'], ['ptype', 'Precip type']].map(([v, t]) => `<button data-v="${v}">${t}</button>`).join('');
+  const have = new Set(S.man.products || ['qpf', 'snow', 'ptype']);
+  $('#product').innerHTML = [['qpf', 'QPF'], ['snow', 'Snowfall'], ['zr', 'Freezing rain'], ['pl', 'Sleet'], ['ptype', 'Precip type']].filter(([v]) => have.has(v)).map(([v, t]) => `<button data-v="${v}">${t}</button>`).join('');
   $('#period').innerHTML = PERIODS.map(([v, t]) => `<button data-v="${v}">${t}</button>`).join('');
   $('#product').onclick = (e) => { const b = e.target.closest('button'); if (!b) return; S.product = b.dataset.v; if (S.product === 'ptype') S.period = 'step'; else if (S.period === 'step') S.period = 24; syncControls(); refresh(); };
   $('#period').onclick = (e) => { const b = e.target.closest('button'); if (!b || b.disabled) return; S.period = b.dataset.v === 'step' ? 'step' : +b.dataset.v; syncControls(); refresh(); };
@@ -457,7 +469,7 @@ async function boot() {
   S.man = man; S.base = `data/${man.base}`; S.steps = man.steps; man.steps.forEach((s) => S.byFhr.set(s.fhr, s));
   lab.places.sort((a, b) => b[3] - a[3]); labelData = lab;
   const hs = Object.fromEntries(new URLSearchParams(location.hash.slice(1)));
-  S.product = ['qpf', 'snow', 'ptype'].includes(hs.p) ? hs.p : 'qpf';
+  S.product = ['qpf', 'snow', 'zr', 'pl', 'ptype'].includes(hs.p) && (!man.products || man.products.includes(hs.p)) ? hs.p : 'qpf';
   S.period = S.product === 'ptype' ? 'step' : hs.per === 'step' ? 'step' : [6, 12, 24, 48].includes(+hs.per) ? +hs.per : 24;
   const want = +hs.f || 24; let best = S.steps.length - 1; S.steps.forEach((s, i) => { if (s.fhr === want) best = i; }); S.idx = Math.min(best, S.steps.length - 1);
   if (hs.s) S.stat = hs.s === 'median' ? 'p50' : hs.s;

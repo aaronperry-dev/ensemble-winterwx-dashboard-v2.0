@@ -1,6 +1,6 @@
 # GEFS Winter Weather
 
-A 31-member GEFS ensemble viewer for **QPF, snowfall and precipitation type** (Revised Bourgouin method,
+A 31-member GEFS ensemble viewer for **QPF, snowfall, freezing rain, sleet and precipitation type** (Revised Bourgouin method,
 Birk et al. 2021, *Weather and Forecasting*). A Python pipeline runs on GitHub Actions four times a day, writes
 small gzipped binary files, and deploys them with a static MapLibre/WebGL viewer to GitHub Pages. No data is
 committed to the repo.
@@ -26,6 +26,7 @@ run is still filling in).
 | NOMADS GRIB filter | A server-side CGI, so there is no file to byte-range. It subsets by variable, level and lat/lon box instead |
 | Rate limits | Token bucket per host, job-wide totals divided across worker processes (aws 80/s, gcs 60/s, NOMADS 1.5/s with 2 connections). `Retry-After` is honored, NOMADS has a 404 budget (8/min) so missing files cannot get the runner IP blocked, and each source has a circuit breaker |
 | Precip type | Wet-bulb profile → melting/refreezing energy → ProbIce, ProbSN, ProbPL, ProbFZRA (Eqs. 2, 7–9). Each member's 3-hr QPF is split among types by probability share |
+| Freezing rain, sleet | Liquid-equivalent accumulations: each step's QPF × the member's freezing-rain (or sleet) share, summed. Not radial ice accretion and not pellet depth |
 | Snowfall | QPF × snow share × SLR / 10 (cm). SLR is **Kuchera** by default (clamped 5–30), or fixed with `--slr-mode fixed:12.5` / the workflow input |
 | Heights | Hypsometric integration of virtual temperature, so no height download is needed |
 
@@ -49,11 +50,11 @@ minus sign into a "2" and the decimal point into a ":", which reads as `−22.1`
 
 `latest.json` lists the run, domain, scales and every step. Each step has two files:
 
-* `cum/fHHH.bin.gz`: **cumulative-since-init** QPF (`u16`, 0.05 mm per count) then snowfall (`u16`, 0.1 cm per count), each `[member][y][x]`.
+* `cum/fHHH.bin.gz`: **cumulative-since-init** `u16 [member][y][x]` arrays, in order: QPF (0.05 mm per count), snowfall (0.1 cm), freezing rain (0.01 mm liquid equivalent), sleet (0.01 mm liquid equivalent). The header's `narr` byte gives the array count, so older 2-array files still read.
 * `ptype/fHHH.bin.gz`: `u8 [4][member][y][x]` = % RA, SN, FZRA, PL (0 where the member's 3-hr QPF is below 0.05 mm).
 
 Cumulative storage means any rolling 3/6/12/24/48-hour total is just `cum(t) − cum(t−w)`, two small files fetched
-by the browser. A full run is about 22 MB. Domain: 60–20°N, 135–50°W, 0.5° (81 × 171). The 64-byte `GWX1` header is
+by the browser. A full run is about 25 MB. Domain: 60–20°N, 135–50°W, 0.5° (81 × 171). The 64-byte `GWX1` header is
 documented in `pipeline/encode.py`.
 
 ## Viewer

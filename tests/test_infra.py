@@ -101,6 +101,15 @@ def test_encode_roundtrip(tmp_path):
     assert (r["nmem"], r["ny"], r["nx"], r["fhr"]) == (31, d.ny, d.nx, 12)
     assert np.abs(r["qpf_mm"] - q).max() <= C.QPF_MM_PER_COUNT / 2 + 1e-4
     assert np.abs(r["snow_cm"] - s).max() <= C.SNOW_CM_PER_COUNT / 2 + 1e-4
+    z = rng.uniform(0, 40, (31, d.ny, d.nx)).astype(np.float32)
+    pl = rng.uniform(0, 30, (31, d.ny, d.nx)).astype(np.float32)
+    p3 = tmp_path / "f012_x.bin.gz"
+    write_cum(p3, 12, 3, q, s, d, z, pl)
+    r3 = read_bin(p3)
+    assert np.abs(r3["zr_mm"] - z).max() <= C.ZR_MM_PER_COUNT / 2 + 1e-4
+    assert np.abs(r3["pl_mm"] - pl).max() <= C.PL_MM_PER_COUNT / 2 + 1e-4
+    assert np.abs(r3["qpf_mm"] - q).max() <= C.QPF_MM_PER_COUNT / 2 + 1e-4       # earlier arrays unaffected
+    assert "zr_mm" not in r                                                      # 2-array files stay readable
     pr = rng.integers(0, 101, (4, 31, d.ny, d.nx)).astype(np.uint8)
     p2 = tmp_path / "pt.bin.gz"
     write_ptype(p2, 12, 3, pr, d)
@@ -117,3 +126,18 @@ def test_default_run_covers_ten_days_three_hourly():
     assert C.DEFAULT_MAX_FHR == 240 and hrs[0] == 3 and hrs[-1] == 240
     assert len(hrs) == 80 and all(b - a == 3 for a, b in zip(hrs, hrs[1:]))
     assert C.forecast_hours(252)[-2:] == [246, 252]        # 6-hourly beyond f240 if ever requested
+
+
+def test_type_qpf_split_conserves_liquid():
+    from pipeline.products import type_qpf_step_mm
+    rng = np.random.default_rng(4)
+    q = rng.uniform(0, 12, (3, 4, 5)).astype(np.float32)
+    probs = rng.integers(0, 101, (4, 3, 4, 5)).astype(np.uint8)
+    probs[:, 0, 0, 0] = 0                                    # a cell with no type information gets nothing
+    parts = type_qpf_step_mm(q, probs)
+    tot = parts.sum(axis=0)
+    has = probs.sum(axis=0) > 0
+    assert np.allclose(tot[has], q[has], atol=1e-4)
+    assert parts[:, 0, 0, 0].sum() == 0
+    only_zr = np.zeros_like(probs); only_zr[2] = 100
+    assert np.allclose(type_qpf_step_mm(q, only_zr)[2], q) and type_qpf_step_mm(q, only_zr)[3].max() == 0

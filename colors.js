@@ -36,3 +36,20 @@ const PTYPE = {
     PL: ["#f9ddcc", "#f9ddcc", "#f9ddcc", "#f9ddcc", "#f9d0c1", "#f9d0c1", "#f9c5b7", "#f9c5b7", "#f9c5b7", "#f9bbae", "#f9bbae", "#f8b5a4", "#f9aca0", "#f9aca0", "#f9aca0", "#f99f94", "#f99f94", "#f9958b", "#f9958b", "#f9958b", "#f88d85", "#f88d85", "#f98078", "#f98078", "#f98078", "#f98078", "#f8766f", "#f7706e", "#f96963", "#f96963", "#f96963", "#f95957", "#f95957"],
   },
 };
+
+/* Freezing rain and sleet accumulations (liquid equivalent, inches). No legend was supplied for these, so the
+ * classes follow the magenta (freezing rain) and salmon (sleet) families of the precipitation-type legend. */
+RAMPS.zr = {
+  title: 'Freezing rain (liquid equiv.)',
+  unit: 'in',
+  edges: [0.01, 0.05, 0.10, 0.15, 0.25, 0.35, 0.50, 0.75, 1.00],
+  labels: ['0.01–0.04', '0.05–0.09', '0.10–0.14', '0.15–0.24', '0.25–0.34', '0.35–0.49', '0.50–0.74', '0.75–0.99', '1.00+'],
+  colors: ['#f9c6f3', '#fc92ef', '#eb78df', '#dc5fcf', '#c740ba', '#b524a7', '#a9119b', '#8f0c91', '#5e0881'],
+};
+RAMPS.pl = {
+  title: 'Sleet / ice pellets (liquid equiv.)',
+  unit: 'in',
+  edges: [0.01, 0.05, 0.10, 0.25, 0.50, 0.75, 1.00, 1.50],
+  labels: ['0.01–0.04', '0.05–0.09', '0.10–0.24', '0.25–0.49', '0.50–0.74', '0.75–0.99', '1.00–1.49', '1.50+'],
+  colors: ['#f9ddcc', '#f9c5b7', '#f9aca0', '#f98078', '#f96963', '#e8433f', '#c92a2a', '#8f1a1a'],
+};
