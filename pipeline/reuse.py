@@ -80,7 +80,8 @@ def load_prior(base_url: str, run_dir: Path, cyc, members: list[str], domain: C.
             log.info("reuse: published data not reused: %s", why)
             return None
     scales = {"qpf_mm_per_count": C.QPF_MM_PER_COUNT, "snow_cm_per_count": C.SNOW_CM_PER_COUNT,
-              "zr_mm_per_count": C.ZR_MM_PER_COUNT, "pl_mm_per_count": C.PL_MM_PER_COUNT}
+              "zr_mm_per_count": C.ZR_MM_PER_COUNT, "pl_mm_per_count": C.PL_MM_PER_COUNT,
+              "swe_mm_per_count": C.SWE_MM_PER_COUNT}
     if man.get("scales") != scales:
         log.info("reuse: published data not reused: file scales differ")
         return None
@@ -122,7 +123,7 @@ def load_prior(base_url: str, run_dir: Path, cyc, members: list[str], domain: C.
             "complete": len(steps) == len(fhrs)}
 
 
-def seed(prior: dict, run_dir: Path, acc, cum_x: dict, keep_hours: int = 24) -> None:
+def seed(prior: dict, run_dir: Path, acc, cum_x: dict, carry: dict | None = None, keep_hours: int = 24) -> None:
     """Restore the running accumulators from published files so the next hour can be added to them."""
     last = prior["steps"][-1]["fhr"]
     for st in prior["steps"]:
@@ -132,3 +133,6 @@ def seed(prior: dict, run_dir: Path, acc, cum_x: dict, keep_hours: int = 24) -> 
     cum_x["snow"][:] = d["snow_cm"]
     cum_x["zr"][:] = d["zr_mm"]
     cum_x["pl"][:] = d["pl_mm"]
+    cum_x["swe"][:] = d["swe_mm"]
+    if carry is not None:                                         # start-of-step type for the first resumed hour
+        carry["probs"] = encode.read_bin(run_dir / prior["steps"][-1]["ptype"])["probs"].copy()

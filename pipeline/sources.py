@@ -52,6 +52,7 @@ class FieldSpec:
     var: str    # GRIB short name as it appears in the .idx ("TMP", "RH", "PRES", "APCP")
     level: str  # as it appears in the .idx ("850 mb", "2 m above ground", "surface")
     key: str    # our internal name: T850, RH850, T2, RH2, PS, APCP
+    optional: bool = False   # may be absent from a file: skip it instead of failing the member
 
 
 def required_fields(levels=C.PLEVELS) -> list[FieldSpec]:
@@ -60,6 +61,10 @@ def required_fields(levels=C.PLEVELS) -> list[FieldSpec]:
         FieldSpec("a", "RH", "2 m above ground", "RH2"),
         FieldSpec("a", "PRES", "surface", "PS"),
         FieldSpec("a", "APCP", "surface", "APCP"),
+        # model-side precip-type information; nice to have, never required
+        FieldSpec("a", "CRAIN", "surface", "CRAIN", True), FieldSpec("a", "CSNOW", "surface", "CSNOW", True),
+        FieldSpec("a", "CICEP", "surface", "CICEP", True), FieldSpec("a", "CFRZR", "surface", "CFRZR", True),
+        FieldSpec("b", "CPOFP", "surface", "CPOFP", True),
     ]
     for lev in levels:
         f = "a" if lev in C.LEVELS_A else "b"
@@ -133,6 +138,8 @@ class IdxRangeSource(Source):
             chosen = []
             for s in specs:
                 e = find_entry(entries, s.var, s.level)
+                if e is None and s.optional:
+                    continue
                 if e is None:
                     raise SourceError(f"{self.name}: {s.var}:{s.level} not in inventory of {t.file}")
                 chosen.append(e)

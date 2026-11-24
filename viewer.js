@@ -14,7 +14,18 @@ const PROB_THRESH = { qpf: [0.01, 0.10, 0.25, 0.50, 1.00, 2.00], snow: [1, 3, 6,
 /* Accumulation products: array key in the cumulative file, header scale slot, and SI unit. Snowfall is in cm; the rest are mm of liquid. */
 const PRODUCTS = { qpf: { name: 'QPF', key: 'q', scale: 's0', si: 'mm' }, snow: { name: 'Snowfall', key: 's', scale: 's1', si: 'cm' },
   zr: { name: 'Freezing rain', key: 'z', scale: 's2', si: 'mm' }, pl: { name: 'Sleet', key: 'p', scale: 's3', si: 'mm' } };
-const siPerIn = (kind) => (PRODUCTS[kind].si === 'cm' ? CM_PER_IN : MM_PER_IN);
+/* Where a product's numbers come from and how they turn into inches.  Snowfall defaults to the Kuchera-ratio depth in the
+ * file; any fixed ratio (10:1, 12:1, 13:1) is applied here to the snow liquid equivalent (array 'w'), so changing the
+ * ratio needs no new data. */
+function src(kind) {
+  const P = PRODUCTS[kind];
+  if (kind === 'snow' && S.slr !== 'kuchera' && S.hasSwe) return { key: 'w', scale: 's4', perIn: MM_PER_IN / +S.slr };
+  return { key: P.key, scale: P.scale, perIn: P.si === 'cm' ? CM_PER_IN : MM_PER_IN };
+}
+const siPerIn = (kind) => src(kind).perIn;
+const isProb = (s) => s.startsWith('prob:') || s.startsWith('nprob:') || s === 'agree';       // map shows a percentage
+const AGREE = { edges: [0.01, 20, 40, 60, 80, 99.9], colors: ['#7f2704', '#d94801', '#fd8d3c', '#fdd0a2', '#9ecae1', '#3182bd'],
+  labels: ['0\u201320%', '20\u201340%', '40\u201360%', '60\u201380%', '80\u201399%', '100%'], prob: true, title: 'Bourgouin vs NCEP type (% of members agreeing)' };
 const PROB_RAMP = {
   qpf: ['#e5f5e0', '#c7e9c0', '#a1d99b', '#74c476', '#41ab5d', '#31a353', '#238b45', '#006d2c', '#00441b'],
   snow: ['#deebf7', '#c6dbef', '#bdd7e7', '#9ecae1', '#6baed6', '#4292c6', '#3182bd', '#08519c', '#082694'],
@@ -23,7 +34,7 @@ const PROB_EDGES = [10, 20, 30, 40, 50, 60, 70, 80, 90];
 
 const S = {
   man: null, base: '', steps: [], byFhr: new Map(), idx: 0,
-  product: 'qpf', period: 24, stat: 'mean', lpmmR: 4, opacity: 0.82,
+  product: 'qpf', period: 24, stat: 'mean', lpmmR: 4, slr: 'kuchera', hasSwe: false, opacity: 0.82,
   cur: null, token: 0, pin: null, playing: false, timer: null,
 };
 let map, wx, labels, labelData, pinMarker;
@@ -55,13 +66,15 @@ async function fetchBin(url) {
     const dv = new DataView(buf);
     const h = { kind: dv.getUint8(4), narr: dv.getUint8(5) || 2, nmem: dv.getUint16(6, true), ny: dv.getUint16(8, true), nx: dv.getUint16(10, true),
       fhr: dv.getUint16(12, true), stepH: dv.getUint16(14, true), s0: dv.getFloat32(32, true), s1: dv.getFloat32(36, true),
-      s2: dv.getFloat32(40, true), s3: dv.getFloat32(44, true), mask: dv.getUint32(48, true) };      // mask 0 = legacy file, all members
+      s2: dv.getFloat32(40, true), s3: dv.getFloat32(44, true), mask: dv.getUint32(48, true), s4: dv.getFloat32(52, true) };      // mask 0 = legacy file, all members
     const n = h.nmem * h.ny * h.nx;
     if (h.kind === 1) {
-      const o = { h }; ['q', 's', 'z', 'p'].slice(0, h.narr).forEach((k, i) => { o[k] = new Uint16Array(buf, 64 + 2 * n * i, n); });
+      const o = { h }; ['q', 's', 'z', 'p', 'w'].slice(0, h.narr).forEach((k, i) => { o[k] = new Uint16Array(buf, 64 + 2 * n * i, n); });
       return o;
     }
-    return { h, p: new Uint8Array(buf, 64, 4 * n) };
+    const o = { h, p: new Uint8Array(buf, 64, 4 * n) };
+    if (dv.getUint8(5) >= 5) o.n = new Uint8Array(buf, 64 + 4 * n, n);       // NCEP's own dominant type per member (0-3, 254 none, 255 unknown)
+    return o;
   });
 }
 const loadCum = (fhr) => fetchBin(S.base + S.byFhr.get(fhr).cum);
@@ -77,15 +90,15 @@ function windowFor(i, period) {
 
 /** Member totals over the window, raw units (mm for QPF, cm for snow). Float32Array(M*N). */
 async function windowValues(kind, i, period, extraMask) {
-  const w = windowFor(i, period), key = PRODUCTS[kind].key;
+  const w = windowFor(i, period), sc = src(kind), key = sc.key;
   const [a, b] = await Promise.all([loadCum(w.end), w.start > 0 ? loadCum(w.start) : null]);
-  if (!a[key]) throw new Error(`${PRODUCTS[kind].name} is not in this run's files yet (the next pipeline run adds it)`);
+  if (!a[key]) throw new Error(`${PRODUCTS[kind].name}${key === 'w' ? ' at a fixed ratio' : ''} is not in this run's files yet (the next pipeline run adds it)`);
   // Members missing from either file (or from `extraMask`) are left out; everything downstream works on the compacted set.
   const full = 2 ** a.h.nmem - 1, mk = (h) => h.mask || full;
   let mask = mk(a.h); if (b) mask = Number(BigInt(mask) & BigInt(mk(b.h))); if (extraMask) mask = Number(BigInt(mask) & BigInt(extraMask));
   const members = EnsStats.membersFromMask(mask, a.h.nmem);
   if (!members.length) throw new Error('no ensemble member has data for this window');
-  const scale = a.h[PRODUCTS[kind].scale], N = a.h.ny * a.h.nx, out = new Float32Array(members.length * N), A = a[key];
+  const scale = a.h[sc.scale], N = a.h.ny * a.h.nx, out = new Float32Array(members.length * N), A = a[key];
   members.forEach((m, j) => {
     const o = m * N, d = j * N;
     if (b) { const B = b[key]; for (let k = 0; k < N; k++) out[d + k] = Math.max(0, A[o + k] - B[o + k]) * scale; }
@@ -126,7 +139,7 @@ async function reduceStat(kind, win, stat) {
     return out;
   }
   const slow = stat === 'pmm' || stat === 'lpmm';
-  const key = slow ? [kind, S.man.init, win.w.start, win.w.end, stat, S.lpmmR].join('|') : null;
+  const key = slow ? [kind, S.man.init, win.w.start, win.w.end, stat, S.lpmmR, kind === 'snow' ? S.slr : ''].join('|') : null;
   if (key && FIELD_MEMO.has(key)) return FIELD_MEMO.get(key);
   const out = slow ? await computeSlow(data, M, ny, nx, stat, S.lpmmR) : EnsStats.compute(data, M, ny, nx, stat, { radius: S.lpmmR });
   if (!out) return null;                              // superseded while computing
@@ -148,12 +161,15 @@ async function ptypeData() {
   const pt = await loadPtype(st.fhr), qw = await windowValues('qpf', S.idx, 'step', pt.h.mask);
   const M = qw.members.length, N = pt.h.ny * pt.h.nx, full = pt.h.nmem * N, p = new Uint8Array(4 * M * N);
   for (let t = 0; t < 4; t++) qw.members.forEach((m, j) => p.set(pt.p.subarray(t * full + m * N, t * full + (m + 1) * N), t * M * N + j * N));
-  return { p, q: qw.data, h: { ...pt.h, nmem: M }, w: qw.w, members: qw.members };
+  let n = null;
+  if (pt.n) { n = new Uint8Array(M * N); qw.members.forEach((m, j) => n.set(pt.n.subarray(m * N, (m + 1) * N), j * N)); }
+  return { p, n, q: qw.data, h: { ...pt.h, nmem: M }, w: qw.w, members: qw.members };
 }
 
 function buildPtype(d, stat) {
   if (isMem(stat) && !d.members.includes(+stat.slice(1))) stat = 'ens';
-  const { p, q, h, w } = d, M = h.nmem, N = h.ny * h.nx, rateDiv = w.hours || 3;
+  if (!d.n && (stat === 'ens-n' || stat === 'agree' || stat.startsWith('nprob:'))) stat = 'ens';      // this hour has no NCEP flags
+  const { p, n: ncep, q, h, w } = d, M = h.nmem, N = h.ny * h.nx, rateDiv = w.hours || 3;
   const field = new Float32Array(N), types = new Float32Array(N), tot = M * N;
   const share = (m, i, t) => { let s = 0; for (let k = 0; k < 4; k++) s += p[k * tot + m * N + i]; return s ? p[t * tot + m * N + i] / s : 0; };
   for (let i = 0; i < N; i++) {
@@ -164,6 +180,23 @@ function buildPtype(d, stat) {
       const want = +stat.slice(5); let k = 0;
       for (let m = 0; m < M; m++) if (domType(p, N, m, i) === want) k++;
       field[i] = (100 * k) / M; types[i] = want;
+    } else if (stat.startsWith('nprob:')) {               // NCEP's dominant type: share of members (that have it) with this type
+      const want = +stat.slice(6); let k = 0, known = 0;
+      for (let m = 0; m < M; m++) { const b = ncep[m * N + i]; if (b === 255) continue; known++; if (b === want) k++; }
+      field[i] = known ? (100 * k) / known : 0; types[i] = want;
+    } else if (stat === 'agree') {                        // members where both methods name the same type
+      let both = 0, tot2 = 0;
+      for (let m = 0; m < M; m++) {
+        const a = domType(p, N, m, i), b = ncep[m * N + i];
+        if (b === 255 || (a < 0 && b > 3)) continue;      // no NCEP data, or neither method has a type: not counted
+        tot2++; if (a === b) both++;
+      }
+      field[i] = tot2 ? (100 * both) / tot2 : 0; types[i] = 0;
+    } else if (stat === 'ens-n') {                        // NCEP dominant type, weighted by each member's QPF
+      const wsum = [0, 0, 0, 0]; let qs = 0;
+      for (let m = 0; m < M; m++) { const qq = q[m * N + i], b = ncep[m * N + i]; qs += qq; if (b < 4 && qq > 0) wsum[b] += qq; }
+      let best = -1, bv = 0; for (const t of TIE_ORDER) if (wsum[t] > bv) { bv = wsum[t]; best = t; }
+      if (best >= 0) { field[i] = dbzOf(qs / M / rateDiv, best); types[i] = best; }
     } else {                                              // 'ens': QPF-weighted dominant type, mean-QPF intensity
       const wsum = [0, 0, 0, 0]; let qs = 0;
       for (let m = 0; m < M; m++) { const qq = q[m * N + i]; qs += qq; if (qq > 0) for (let t = 0; t < 4; t++) wsum[t] += qq * share(m, i, t); }
@@ -176,8 +209,9 @@ function buildPtype(d, stat) {
 
 /* ============================================================================= rendering */
 function classesFor() {
-  if (S.stat.startsWith('prob:')) {
-    const k = PROB_RAMP[S.product] || ptypeProbColors(S.product === 'zr' ? 2 : S.product === 'pl' ? 3 : +S.stat.slice(5));
+  if (S.stat === 'agree') return AGREE;
+  if (isProb(S.stat)) {
+    const k = PROB_RAMP[S.product] || ptypeProbColors(S.product === 'zr' ? 2 : S.product === 'pl' ? 3 : +S.stat.split(':')[1]);
     return { edges: PROB_EDGES, colors: k, labels: PROB_EDGES.map((e) => `${e}%+`), prob: true };
   }
   return RAMPS[S.product];
@@ -190,7 +224,7 @@ async function refresh() {
     if (S.product === 'ptype') {
       const d = await ptypeData(); if (tok !== S.token) return;
       const { field, types } = buildPtype(d, S.stat);
-      if (S.stat.startsWith('prob:')) { const c = classesFor(); wx.setClasses(c.edges, c.colors); }
+      if (isProb(S.stat)) { const c = classesFor(); wx.setClasses(c.edges, c.colors); }
       else wx.setPtypeLut(PTYPE.ramps, PTYPE.names, PTYPE.dbzMin, PTYPE.dbzStep);
       wx.setField(field, types); S.cur = { kind: 'ptype', d, field };
     } else {
@@ -237,7 +271,7 @@ const pad = (n, w = 3) => String(n).padStart(w, '0');
 
 function productName() {
   if (S.product === 'ptype') return 'Precipitation type';
-  const nm = PRODUCTS[S.product].name;
+  const nm = PRODUCTS[S.product].name + (S.product === 'snow' && S.hasSwe ? (S.slr === 'kuchera' ? ' (Kuchera ratio)' : ` (${S.slr}:1)`) : '');
   const w = windowFor(S.idx, S.period);
   return `${w.since ? `${w.hours}-hr (since init)` : `${w.hours}-hr`} ${nm}`;
 }
@@ -247,10 +281,13 @@ function statName() {
   if (s === 'pmm') return 'Probability-matched mean (PMM)';
   if (s === 'lpmm') return `Local prob.-matched mean (LPMM \u00b1${lpmmMi()} mi)`;
   if (EnsStats.isPct(s)) return s === 'p50' ? '50th percentile (median)' : `${s.slice(1)}th percentile`;
-  if (s === 'ens') return 'Most likely type (ensemble)';
+  if (s === 'ens') return 'Most likely type (Revised Bourgouin)';
+  if (s === 'ens-n') return 'Most likely type (NCEP dominant type)';
+  if (s === 'agree') return 'Agreement between Bourgouin and NCEP types';
+  if (s.startsWith('nprob:')) return `NCEP: probability of ${PTYPE.long[+s.slice(6)].toLowerCase()}`;
   if (s.startsWith('prob:')) {
     const v = +s.slice(5);
-    return S.product === 'ptype' ? `Probability of ${PTYPE.long[v].toLowerCase()}` : `Probability ≥ ${v}″`;
+    return S.product === 'ptype' ? `Bourgouin: probability of ${PTYPE.long[v].toLowerCase()}` : `Probability ≥ ${v}″`;
   }
   const m = +s.slice(1); return m === 0 ? 'Control (c00)' : `Member p${pad(m, 2)}`;
 }
@@ -282,7 +319,7 @@ function updateTitle() {
 function updateLegend() {
   const el = $('#legend-body'); el.innerHTML = '';
   const hdr = $('#legend-title');
-  if (S.product === 'ptype' && !S.stat.startsWith('prob:')) {
+  if (S.product === 'ptype' && !isProb(S.stat)) {
     hdr.textContent = 'Type color ramps — 3-hr QPF as dBZ';
     PTYPE.names.forEach((n, t) => {
       const row = document.createElement('div'); row.className = 'pt-row';
@@ -298,7 +335,7 @@ function updateLegend() {
     note.textContent = 'dBZ ≈ rate from 3-hr QPF (rain/ice: Z=200R^1.6, snow: Z=1780R^2.21)'; el.appendChild(note); return;
   }
   const c = classesFor();
-  hdr.textContent = c.prob ? `Probability (% of ${stepN(S.idx)} members)` :
+  hdr.textContent = c.title && c.prob ? c.title : c.prob ? `Probability (% of ${stepN(S.idx)} members)` :
     `${c.title} (in)`;
   for (let i = c.colors.length - 1; i >= 0; i--) {
     const row = document.createElement('div'); row.className = 'lg-row';
@@ -392,6 +429,17 @@ function ptypeTip(ll, d) {
   h2 += `<div class="tip-grid"><span>Members with precip</span><b>${wet} / ${M}</b><span>Mean 3-hr QPF</span><b>${fmtVal('qpf', qm / MM_PER_IN)}</b></div>`;
   h2 += '<div class="tip-s">Dominant type (members)</div><div class="tip-p">';
   order.forEach((t) => { h2 += `<span><i class="sw" style="background:${PTYPE.ramps[PTYPE.names[t]][18]}"></i>${PTYPE.long[t]}</span><i><u style="width:${(100 * cnt[t]) / M}%"></u></i><b>${cnt[t]}</b>`; });
+  if (d.n) {
+    const nc = [0, 0, 0, 0]; let known = 0, agree = 0, either = 0;
+    for (let m = 0; m < M; m++) {
+      const b = d.n[m * N + i], a = domType(p, N, m, i); if (b === 255) continue;
+      known++; if (b < 4) nc[b]++;
+      if (a >= 0 || b < 4) { either++; if (a === b) agree++; }
+    }
+    h2 += '</div><div class="tip-s">NCEP dominant type (members)</div><div class="tip-p">';
+    order.forEach((t) => { h2 += `<span><i class="sw" style="background:${PTYPE.ramps[PTYPE.names[t]][18]}"></i>${PTYPE.long[t]}</span><i><u style="width:${known ? (100 * nc[t]) / known : 0}%"></u></i><b>${nc[t]}</b>`; });
+    h2 += `</div><div class="tip-grid"><span>Methods agree</span><b>${agree} / ${either}</b></div><div class="tip-p">`;
+  }
   h2 += '</div><div class="tip-s">Mean Bourgouin probability (wet members)</div><div class="tip-grid">';
   order.forEach((t) => { h2 += `<span>${PTYPE.long[t]}</span><b>${wet ? Math.round(avg[t] / wet) : 0}%</b>`; });
   return h2 + '</div>';
@@ -433,8 +481,10 @@ function statOptions() {
   const M = S.man.members, opts = [];
   const g = (label, items) => opts.push(`<optgroup label="${label}">${items.map(([v, t]) => `<option value="${v}">${t}</option>`).join('')}</optgroup>`);
   if (S.product === 'ptype') {
-    g('Ensemble', [['ens', 'Most likely type (QPF-weighted)']]);
-    g('Probability of type', PTYPE.names.map((n, t) => [`prob:${t}`, `${PTYPE.long[t]} (% of members)`]));
+    const nc = !!S.steps[S.idx].ncep;                // NCEP's own flags are in this hour's file
+    g('Ensemble', [['ens', 'Most likely type: Revised Bourgouin'], ...(nc ? [['ens-n', 'Most likely type: NCEP dominant type'], ['agree', 'Agreement: Bourgouin vs NCEP']] : [])]);
+    g('Probability of type: Revised Bourgouin', PTYPE.names.map((n, t) => [`prob:${t}`, `${PTYPE.long[t]} (% of members)`]));
+    if (nc) g('Probability of type: NCEP dominant', PTYPE.names.map((n, t) => [`nprob:${t}`, `${PTYPE.long[t]} (% of members)`]));
   } else {
     g('Ensemble statistics', [['min', 'Minimum'], ['p5', '5th percentile'], ['p10', '10th percentile'], ['p25', '25th percentile'], ['p50', '50th percentile (median)'],
       ['mean', 'Mean'], ['p75', '75th percentile'], ['p90', '90th percentile'], ['p95', '95th percentile'], ['max', 'Maximum']]);
@@ -452,13 +502,16 @@ function syncControls() {
   if (!valid.includes(S.stat)) S.stat = S.product === 'ptype' ? 'ens' : 'mean';
   $('#stat').value = S.stat;
   $('#lpmm-wrap').hidden = S.stat !== 'lpmm'; $('#lpmm-r').value = String(S.lpmmR);
+  $('#slr-wrap').hidden = !(S.product === 'snow' && S.hasSwe); $('#slr').value = S.slr;
   const help = { pmm: 'Ensemble-mean pattern with amplitudes re-assigned from all members pooled over the whole map, so peaks are not smoothed away.',
-    lpmm: `Same matching done separately inside a \u00b1${lpmmMi()}-mile neighborhood around each point: keeps local detail and avoids mixing different weather regimes.` }[S.stat];
+    lpmm: `Same matching done separately inside a \u00b1${lpmmMi()}-mile neighborhood around each point: keeps local detail and avoids mixing different weather regimes.`,
+    'ens-n': 'The type NCEP\u2019s own post-processor picked for each member (dominant of four wet-bulb schemes), weighted by QPF.',
+    agree: 'Share of members, at each point, where Revised Bourgouin and NCEP name the same type. Low values mark places where the type depends on the method.' }[S.stat];
   $('#stat-help').textContent = help || ''; $('#stat-help').hidden = !help;
   document.querySelectorAll('#product button').forEach((b) => b.classList.toggle('on', b.dataset.v === S.product));
   document.querySelectorAll('#period button').forEach((b) => { b.classList.toggle('on', String(b.dataset.v) === String(S.period)); b.disabled = S.product === 'ptype' && b.dataset.v !== 'step'; });
   $('#period-note').hidden = S.product !== 'ptype';
-  location.hash = `p=${S.product}&per=${S.period}&s=${S.stat}${S.stat === 'lpmm' ? `&r=${S.lpmmR}` : ''}&f=${S.steps[S.idx].fhr}`;
+  location.hash = `p=${S.product}&per=${S.period}&s=${S.stat}${S.stat === 'lpmm' ? `&r=${S.lpmmR}` : ''}${S.product === 'snow' && S.hasSwe && S.slr !== 'kuchera' ? `&slr=${S.slr}` : ''}&f=${S.steps[S.idx].fhr}`;
 }
 
 function buildUI() {
@@ -469,6 +522,7 @@ function buildUI() {
   $('#period').onclick = (e) => { const b = e.target.closest('button'); if (!b || b.disabled) return; S.period = b.dataset.v === 'step' ? 'step' : +b.dataset.v; syncControls(); refresh(); };
   $('#stat').onchange = (e) => { S.stat = e.target.value; syncControls(); refresh(); };
   $('#lpmm-r').onchange = (e) => { S.lpmmR = +e.target.value; syncControls(); refresh(); };
+  $('#slr').onchange = (e) => { S.slr = e.target.value; syncControls(); refresh(); };
   $('#opacity').oninput = (e) => wx.setOpacity(+e.target.value / 100);
   const vis = (id, layers) => ($(id).onchange = (e) => layers.forEach((l) => map.setLayoutProperty(l, 'visibility', e.target.checked ? 'visible' : 'none')));
   vis('#tg-counties', ['counties-line']); vis('#tg-states', ['admin1-line']); vis('#tg-rivers', ['rivers']); vis('#tg-grat', ['graticule']);
@@ -514,6 +568,8 @@ async function boot() {
   const want = +hs.f || 24; let best = S.steps.length - 1; S.steps.forEach((s, i) => { if (s.fhr === want) best = i; }); S.idx = Math.min(best, S.steps.length - 1);
   if (hs.s) S.stat = hs.s === 'median' ? 'p50' : hs.s;
   if ([2, 4, 6, 8].includes(+hs.r)) S.lpmmR = +hs.r;
+  S.hasSwe = !!(man.scales && man.scales.swe_mm_per_count);
+  if (S.hasSwe && ['10', '12', '13'].includes(hs.slr)) S.slr = hs.slr;
   await new Promise((res) => (map.loaded() ? res() : map.once('load', res)));
   wx = new WxLayer({ opacity: S.opacity }); wx.setDomain(man.domain);
   map.addLayer(wx, 'counties-hit');

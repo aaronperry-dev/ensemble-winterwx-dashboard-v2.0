@@ -26,7 +26,7 @@ def fetch_fields(chain: SourceChain, date: str, cycle: str, member: str, fhr: in
         fields.update(arrs)
         used[kind] = src
         window = win or window
-    missing = [s.key for s in specs if s.key not in fields]
+    missing = [s.key for s in specs if s.key not in fields and not s.optional]
     if missing:
         raise SourceError(f"{member} f{fhr:03d}: decoded GRIB is missing {missing}")
     if window is None:
@@ -47,3 +47,25 @@ def compute_member_step(fields: dict[str, np.ndarray], levels=C.PLEVELS, slr_mod
         slr_mode=slr_mode, slr_min=slr_min, slr_max=slr_max,
     )
     return probs, slr
+
+
+NCEP_PRIORITY = (0, 3, 1, 2)      # applied in this order, so the last one wins: freezing rain > snow > sleet > rain
+
+
+def type_extras(fields: dict[str, np.ndarray]):
+    """Optional model-side precip-type information -> (cpofp, ncep_code); either is None when it was not in the files.
+
+    cpofp:      float32 (ny, nx) percent frozen precipitation; NaN where the model has no precipitation (it uses -50).
+    ncep_code:  uint8 (ny, nx): the type from NCEP's own multi-algorithm dominant-type flags (0 RA, 1 SN, 2 FZRA, 3 PL),
+                C.NCEP_NONE where no flag is set (no precipitation at the valid time).
+    """
+    cp = fields.get("CPOFP")
+    cpofp = None if cp is None else np.where((cp >= 0) & (cp <= 100), cp, np.nan).astype(np.float32)
+    flags = [fields.get(k) for k in ("CRAIN", "CSNOW", "CFRZR", "CICEP")]       # order = RA, SN, FZRA, PL
+    if any(f is None for f in flags):
+        return cpofp, None
+    on = np.stack([np.nan_to_num(f, nan=0.0) > 0.5 for f in flags])
+    code = np.full(on.shape[1:], C.NCEP_NONE, np.uint8)
+    for t in NCEP_PRIORITY:
+        code[on[t]] = t
+    return cpofp, code

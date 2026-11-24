@@ -11,6 +11,9 @@ except ImportError:  # pragma: no cover
     pygrib = None
 
 
+NCEP_FLAGS = {192: "CRAIN", 193: "CFRZR", 194: "CICEP", 195: "CSNOW"}   # local-use parameter numbers, category 1
+
+
 def identify(msg) -> tuple[str, tuple[int, int] | None] | None:
     """Map a GRIB message to (internal key, accumulation window) or None if unwanted.
 
@@ -35,6 +38,10 @@ def identify(msg) -> tuple[str, tuple[int, int] | None] | None:
         return "PS", None
     elif (cat, num) == (1, 8) and tol == "surface":   # total precipitation (accumulated)
         return "APCP", (int(msg["startStep"]), int(msg["endStep"]))
+    elif cat == 1 and tol == "surface" and num in NCEP_FLAGS:   # NCEP dominant-type categorical flags
+        return NCEP_FLAGS[num], None
+    elif (cat, num) == (1, 39) and tol == "surface":  # percent frozen precipitation (-50 = no precipitation)
+        return "CPOFP", None
     return None
 
 

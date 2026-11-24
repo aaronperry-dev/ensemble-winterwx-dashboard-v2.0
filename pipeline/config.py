@@ -77,6 +77,8 @@ QPF_MM_PER_COUNT = 0.05   # uint16 cumulative liquid-equivalent  (max 3276 mm)
 SNOW_CM_PER_COUNT = 0.1   # uint16 cumulative snowfall            (max 6553 cm)
 ZR_MM_PER_COUNT = 0.01    # uint16 cumulative freezing-rain liquid equivalent (max 655 mm)
 PL_MM_PER_COUNT = 0.01    # uint16 cumulative sleet / ice-pellet liquid equivalent (max 655 mm)
+SWE_MM_PER_COUNT = 0.02   # uint16 cumulative snow liquid equivalent, any snow ratio can be applied in the viewer (max 1310 mm)
+NCEP_NONE, NCEP_UNKNOWN = 254, 255   # codes in the ptype file's NCEP-type plane (0-3 = RA, SN, FZRA, PL)
 
 # --------------------------------------------------------------------------- data sources
 S3_BASE = "https://noaa-gefs-pds.s3.amazonaws.com"

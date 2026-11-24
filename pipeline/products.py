@@ -53,3 +53,42 @@ def type_qpf_step_mm(qpf_mm: np.ndarray, probs: np.ndarray) -> np.ndarray:
     wherever any type probability is non-zero.
     """
     return (type_shares(probs) * qpf_mm[None]).astype(np.float32)
+
+
+def cap_freezing_rain(probs: np.ndarray, cpofp: np.ndarray | None) -> np.ndarray:
+    """Do not let freezing rain exceed the liquid fraction that the model's own microphysics reports.
+
+    probs: (4, ...) percent [RA, SN, FZRA, PL] (Revised Bourgouin); cpofp: percent frozen precipitation from the GEFS
+    output (same trailing shape; NaN = unknown).  Where Bourgouin puts more of the precipitation into freezing rain than
+    the model says is liquid (100 - CPOFP), the excess moves to the frozen types in proportion to their current share
+    (all of it to snow if both are zero).  One-sided on purpose: rain is never turned into snow, so marginal-temperature
+    events do not gain the snow that NCEP's own 10:1 maps are criticized for (Manikin 2021).
+    """
+    if cpofp is None:
+        return probs
+    p = probs.astype(np.float32)
+    known = np.isfinite(cpofp) & (cpofp >= 0) & (cpofp <= 100)
+    liquid_cap = np.where(known, (100.0 - np.where(known, cpofp, 0.0)) / 100.0, 1.0) * p.sum(axis=0)
+    excess = np.where(p[2] > liquid_cap, p[2] - liquid_cap, 0.0)
+    frozen = p[1] + p[3]
+    to_sn = np.where(frozen > 0, p[1] / np.maximum(frozen, 1e-6), 1.0)
+    out = p.copy()
+    out[2] = p[2] - excess
+    out[1] = np.minimum(p[1] + excess * to_sn, 100.0)
+    out[3] = np.minimum(p[3] + excess * (1.0 - to_sn), 100.0)
+    return np.rint(out).astype(np.uint8)
+
+
+def step_average_shares(cur: np.ndarray, prev: np.ndarray | None) -> np.ndarray:
+    """Type shares (as percent, float) to apply to a step's QPF: the mean of the shares at the start and end of the step.
+
+    A single end-of-step profile stands in for the whole 3 hours otherwise, so a changeover inside the step is assigned
+    to one side.  Where only one end has a type (precipitation starting or ending) that end is used.
+    cur / prev: (4, ...) percent, already masked to zero where the step is dry.
+    """
+    c = 100.0 * type_shares(cur)
+    if prev is None:
+        return c
+    pr = 100.0 * type_shares(prev)
+    has_c, has_p = (cur.sum(axis=0) > 0)[None], (prev.sum(axis=0) > 0)[None]
+    return np.where(has_c & has_p, 0.5 * (c + pr), np.where(has_c, c, pr)).astype(np.float32)

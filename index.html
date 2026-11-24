@@ -39,6 +39,10 @@
     <select id="lpmm-r"><option value="2">&plusmn;1&deg; (~70 mi)</option><option value="4">&plusmn;2&deg; (~140 mi)</option><option value="6">&plusmn;3&deg; (~210 mi)</option><option value="8">&plusmn;4&deg; (~280 mi)</option></select>
   </div>
   <p id="stat-help" class="fine" hidden></p>
+  <div id="slr-wrap" hidden>
+    <label class="lbl" for="slr">Snow-to-liquid ratio</label>
+    <select id="slr"><option value="kuchera">Kuchera (variable, 12:1 baseline)</option><option value="13">13:1 fixed</option><option value="12">12:1 fixed</option><option value="10">10:1 fixed (reference)</option></select>
+  </div>
 
   <div class="row2">
     <div><label class="lbl" for="opacity">Opacity</label>
@@ -62,8 +66,9 @@
 
   <details>
     <summary>Method &amp; data</summary>
-    <p><b>Precip type</b> uses the Revised Bourgouin algorithm (Birk et&nbsp;al. 2021, <i>Wea. Forecasting</i>) on each member's wet-bulb profile; its four probabilities (rain, snow, freezing rain, sleet) split that member's QPF.</p>
-    <p><b>Snowfall</b> = 3-hr QPF &times; snow share &times; snow-to-liquid ratio (Kuchera: warmest temperature surface&ndash;500&nbsp;mb), summed over the period.</p>
+    <p><b>Precip type</b> uses the Revised Bourgouin algorithm (Birk et&nbsp;al. 2021, <i>Wea. Forecasting</i>) on each member's wet-bulb profile; its four probabilities (rain, snow, freezing rain, sleet) split that member's QPF. The freezing-rain share is capped by the model's own liquid fraction (100&nbsp;&minus;&nbsp;percent frozen precipitation), and for accumulations the shares are averaged over each 3-hr step rather than taken at its end.</p>
+    <p><b>NCEP dominant type</b> is the type GEFS itself assigns each member (four wet-bulb schemes, ties resolved freezing rain &gt; snow &gt; sleet &gt; rain). It is offered as an alternate map and as probabilities, and <b>Agreement</b> shows where the two methods name the same type; low values mark places where the type depends on the method.</p>
+    <p><b>Snowfall</b> = 3-hr QPF &times; snow share &times; snow-to-liquid ratio, summed over the period. The default is Kuchera (warmest temperature surface&ndash;500&nbsp;mb, 12:1 baseline); the selector also offers a fixed 13:1, 12:1 or 10:1 applied to the snow liquid equivalent. Fixed ratios in the 12&ndash;13:1 range often verify better than 10:1 in the Northeast.</p>
     <p><b>Freezing rain</b> and <b>sleet</b> are the liquid-equivalent part of each member's QPF that the Bourgouin probabilities assign to that type. Freezing rain is not radial ice accretion (no wind, surface or icing-efficiency adjustment); sleet is liquid, not pellet depth.</p>
     <p><b>Statistics</b> are computed per grid cell from the 31 member totals (percentiles interpolate between ranked members). <b>PMM</b> (Ebert 2001) keeps the ensemble-mean pattern but takes its amplitudes from all members pooled over the map; <b>LPMM</b> (Clark 2017; Snook et&nbsp;al.) does the same inside a neighborhood around each point.</p>
     <p><b>Periods</b> are rolling windows ending at the selected hour. Before the window fits in the run, the total since initialization is shown.</p>

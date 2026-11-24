@@ -38,7 +38,7 @@ import numpy as np
 from . import config as C
 
 MAGIC = b"GWX1"
-HEADER = struct.Struct("<4sBBHHHHHffffffffI")
+HEADER = struct.Struct("<4sBBHHHHHffffffffIf")      # ... mask, then the 5th scale (snow liquid equivalent)
 HEADER_SIZE = 64
 KIND_CUM, KIND_PTYPE = 1, 2
 
@@ -54,9 +54,10 @@ def mask_of(present_idx) -> int:
     return m
 
 
-def _header(kind, nmem, ny, nx, fhr, step_h, domain: C.Domain, scales=(0.0, 0.0, 0.0, 0.0), narr=0, mask=0) -> bytes:
+def _header(kind, nmem, ny, nx, fhr, step_h, domain: C.Domain, scales=(0.0,) * 5, narr=0, mask=0) -> bytes:
+    scales = tuple(scales) + (0.0,) * (5 - len(scales))
     raw = HEADER.pack(MAGIC, kind, narr, nmem, ny, nx, fhr, step_h,
-                      domain.lat_north, domain.lon_west, domain.res, domain.res, *scales, mask)
+                      domain.lat_north, domain.lon_west, domain.res, domain.res, *scales[:4], mask, scales[4])
     return raw + b"\x00" * (HEADER_SIZE - len(raw))
 
 
@@ -74,29 +75,38 @@ def quantize(arr: np.ndarray, per_count: float) -> np.ndarray:
 
 def write_cum(path: Path, fhr: int, step_h: int, qpf_cum_mm: np.ndarray, snow_cum_cm: np.ndarray,
               domain: C.Domain, zr_cum_mm: np.ndarray | None = None, pl_cum_mm: np.ndarray | None = None,
-              mask: int | None = None) -> int:
+              mask: int | None = None, swe_cum_mm: np.ndarray | None = None) -> int:
     m, ny, nx = qpf_cum_mm.shape
     mask = full_mask(m) if mask is None else mask
     parts = [quantize(qpf_cum_mm, C.QPF_MM_PER_COUNT), quantize(snow_cum_cm, C.SNOW_CM_PER_COUNT)]
-    scales = [C.QPF_MM_PER_COUNT, C.SNOW_CM_PER_COUNT, 0.0, 0.0]
+    scales = [C.QPF_MM_PER_COUNT, C.SNOW_CM_PER_COUNT, 0.0, 0.0, 0.0]
     if zr_cum_mm is not None and pl_cum_mm is not None:
         parts += [quantize(zr_cum_mm, C.ZR_MM_PER_COUNT), quantize(pl_cum_mm, C.PL_MM_PER_COUNT)]
-        scales[2:] = [C.ZR_MM_PER_COUNT, C.PL_MM_PER_COUNT]
+        scales[2:4] = [C.ZR_MM_PER_COUNT, C.PL_MM_PER_COUNT]
+        if swe_cum_mm is not None:
+            parts.append(quantize(swe_cum_mm, C.SWE_MM_PER_COUNT))
+            scales[4] = C.SWE_MM_PER_COUNT
     body = b"".join(a.astype("<u2").tobytes() for a in parts)
     return _write_gz(Path(path), _header(KIND_CUM, m, ny, nx, fhr, step_h, domain, tuple(scales), len(parts), mask) + body)
 
 
-def write_ptype(path: Path, fhr: int, step_h: int, probs_u8: np.ndarray, domain: C.Domain, mask: int | None = None) -> int:
-    """probs_u8: (4, nmem, ny, nx)."""
+def write_ptype(path: Path, fhr: int, step_h: int, probs_u8: np.ndarray, domain: C.Domain, mask: int | None = None,
+                ncep_code: np.ndarray | None = None) -> int:
+    """probs_u8: (4, nmem, ny, nx) Bourgouin percent [RA, SN, FZRA, PL].
+    ncep_code (optional): (nmem, ny, nx) uint8, NCEP's dominant type (0-3, C.NCEP_NONE, C.NCEP_UNKNOWN), stored as a 5th plane."""
     _, m, ny, nx = probs_u8.shape
-    hdr = _header(KIND_PTYPE, m, ny, nx, fhr, step_h, domain, mask=full_mask(m) if mask is None else mask)
-    return _write_gz(Path(path), hdr + np.ascontiguousarray(probs_u8, dtype=np.uint8).tobytes())
+    body = np.ascontiguousarray(probs_u8, dtype=np.uint8).tobytes()
+    if ncep_code is not None:
+        body += np.ascontiguousarray(ncep_code, dtype=np.uint8).tobytes()
+    hdr = _header(KIND_PTYPE, m, ny, nx, fhr, step_h, domain, narr=5 if ncep_code is not None else 0,
+                  mask=full_mask(m) if mask is None else mask)
+    return _write_gz(Path(path), hdr + body)
 
 
 def read_bin(path: Path) -> dict:
     """Reference reader (used by tests; the browser has its own JS reader)."""
     raw = gzip.open(path, "rb").read()
-    (magic, kind, narr, nmem, ny, nx, fhr, step_h, lat0, lon0, dlat, dlon, s0, s1, s2, s3, mask) = HEADER.unpack_from(raw)
+    (magic, kind, narr, nmem, ny, nx, fhr, step_h, lat0, lon0, dlat, dlon, s0, s1, s2, s3, mask, s4) = HEADER.unpack_from(raw)
     if magic != MAGIC:
         raise ValueError("bad magic")
     n = nmem * ny * nx
@@ -111,6 +121,10 @@ def read_bin(path: Path) -> dict:
         if narr >= 4:
             out["zr_mm"] = arrs[2].astype(np.float32) * s2
             out["pl_mm"] = arrs[3].astype(np.float32) * s3
+        if narr >= 5:
+            out["swe_mm"] = arrs[4].astype(np.float32) * s4
     else:
         out["probs"] = np.frombuffer(raw, np.uint8, 4 * n, off).reshape(4, nmem, ny, nx)
+        if narr >= 5:
+            out["ncep"] = np.frombuffer(raw, np.uint8, n, off + 4 * n).reshape(nmem, ny, nx)
     return out
