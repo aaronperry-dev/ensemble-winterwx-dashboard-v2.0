@@ -504,7 +504,7 @@ function unpin() { S.pin = null; tip().classList.remove('show', 'pinned'); if (p
 const hhZ = (iso) => `${iso.slice(5, 10).replace('-', '/')} ${iso.slice(11, 13)}Z`;
 function makeSource(key, man) {
   const byFhr = new Map(); man.steps.forEach((st) => byFhr.set(st.fhr, st));
-  return { key, man, base: `data/${key}/${man.base}`, byFhr, steps: man.steps };
+  return { key, man, base: `${man.legacy ? 'data' : `data/${key}`}/${man.base}`, byFhr, steps: man.steps };
 }
 const loadedFams = () => FAM_KEYS.filter((k) => S.sets[k] && S.sets[k].latest && S.sets[k].latest.steps.length);
 
@@ -653,8 +653,9 @@ function togglePlay() {
 async function boot() {
   map = createMap('map');
   const getJson = (u) => fetch(`${u}?t=${Date.now()}`, { cache: 'no-store' }).then((r) => (r.ok ? r.json() : null)).catch(() => null);
-  const [gl, gs, il, pl, lab] = await Promise.all([getJson('data/gefs/latest.json'), getJson('data/gefs/synoptic.json'), getJson('data/ifs/latest.json'),
+  let [gl, gs, il, pl, lab] = await Promise.all([getJson('data/gefs/latest.json'), getJson('data/gefs/synoptic.json'), getJson('data/ifs/latest.json'),
     getJson('data/geps/latest.json'), fetch('basemap_labels.json').then((r) => r.json())]);
+  if (!gl) { const old = await getJson('data/latest.json'); if (old) { old.legacy = true; gl = old; } }   // single-model layout written by the older workflow
   S.sets = { gefs: { latest: gl, syn: gs }, ifs: { latest: il }, geps: { latest: pl } };
   if (!loadedFams().length) throw new Error('No model data found yet \u2014 the pipeline has not published a run');
   lab.places.sort((a, b) => b[3] - a[3]); labelData = lab;
