@@ -151,3 +151,12 @@ def test_site_ships_every_script_the_page_loads():
     assert srcs and all(s in ASSETS for s in srcs), srcs
     assert "statworker.js" in ASSETS            # loaded by viewer.js via new Worker(...)
     assert "importScripts('ensstats.js')" in (ROOT / "statworker.js").read_text()
+
+
+def test_site_ships_the_station_list(tmp_path):
+    import json
+    from pipeline import site
+    assert "stations.json" in site.ASSETS and "stations.js" in site.ASSETS
+    site.build(tmp_path)
+    lst = json.loads((tmp_path / "stations.json").read_text())
+    assert len(lst) > 60 and {"id", "lat", "lon", "type"} <= set(lst[0])
