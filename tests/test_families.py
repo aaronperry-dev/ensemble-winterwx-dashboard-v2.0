@@ -169,7 +169,7 @@ def test_geps_file_names_and_member_assembly(monkeypatch):
     assert ch.url("20261124", "12", 24, "TMP", "ISBL_0850") == (
         "http://m/20261124/WXO-DD/ensemble/geps/grib2/raw/12/024/CMC_geps-raw_TMP_ISBL_0850_latlon0p5x0p5_2026112412_P024_allmbrs.grib2")
 
-    def fake_decode(msgs, domain):
+    def fake_decode(msgs, domain, windows=None):
         var = seen[-1].split("CMC_geps-raw_")[1].split("_latlon")[0]
         key = {"TMP_ISBL_1000": "T1000", "TMP_ISBL_0850": "T850", "RH_ISBL_1000": "RH1000", "RH_ISBL_0850": "RH850",
                "TMP_TGL_2m": "T2", "RH_TGL_2m": "RH2", "PRES_SFC_0": "PS", "APCP_SFC_0": "APCP"}[var]
@@ -177,7 +177,7 @@ def test_geps_file_names_and_member_assembly(monkeypatch):
         return {key: {n: np.full((NY, NX), float(n + 1), np.float32) for n in range(n_members)}}, ((0, 24) if key == "APCP" else None)
 
     monkeypatch.setattr(geps, "decode_members", fake_decode)
-    out, win, used = ch.fetch_step("20261124", "12", 24)
+    out, win, used = ch.fetch_step("20261124", "12", 21)                       # a 3-hourly hour: GEPS has no 2 m extremes then
     assert win == (0, 24) and used == {"geps": "msc"} and len(seen) == len(specs)
     assert sorted(out) == [0, 1]                                               # only members that have every field
     assert float(out[1]["T850"][0, 0]) == 2.0
