@@ -51,7 +51,7 @@ jobs:
       - name: Unit tests (Python pipeline, JS ensemble statistics)
         run: |
           python -m pytest -q tests
-          node --test tests/ensstats.test.js
+          node --test tests/ensstats.test.js tests/tempdays.test.js
 
   build:
     needs: test
