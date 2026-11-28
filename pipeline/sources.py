@@ -55,7 +55,9 @@ class FieldSpec:
     optional: bool = False   # may be absent from a file: skip it instead of failing the member
 
 
-def required_fields(levels=C.PLEVELS) -> list[FieldSpec]:
+def required_fields(levels=C.PLEVELS, extremes: bool = False) -> list[FieldSpec]:
+    """Fields to fetch for one member and hour.  `extremes` adds the 2 m maximum / minimum temperature over the window ending
+    at this hour (optional: a member without them just has no daily extremes for that block)."""
     specs = [
         FieldSpec("a", "TMP", "2 m above ground", "T2"),
         FieldSpec("a", "RH", "2 m above ground", "RH2"),
@@ -64,6 +66,8 @@ def required_fields(levels=C.PLEVELS) -> list[FieldSpec]:
         # model-side percent frozen precipitation (for the freezing-rain cap); nice to have, never required
         FieldSpec("b", "CPOFP", "surface", "CPOFP", True),
     ]
+    if extremes:
+        specs += [FieldSpec("a", "TMAX", "2 m above ground", "TMAX", True), FieldSpec("a", "TMIN", "2 m above ground", "TMIN", True)]
     for lev in levels:
         f = "a" if lev in C.LEVELS_A else "b"
         specs.append(FieldSpec(f, "TMP", f"{lev} mb", f"T{lev}"))

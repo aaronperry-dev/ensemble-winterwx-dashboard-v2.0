@@ -9,7 +9,7 @@ import shutil
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-ASSETS = ["index.html", "style.css", "colors.js", "wxlayer.js", "basemap.js", "ensstats.js", "statworker.js", "viewer.js",
+ASSETS = ["index.html", "style.css", "colors.js", "tempdays.js", "wxlayer.js", "basemap.js", "ensstats.js", "statworker.js", "viewer.js",
           "maplibre-gl.js", "maplibre-gl.css", "maplibre-gl.LICENSE.txt"]
 ASSET_GLOBS = ["basemap_*.json"]
 

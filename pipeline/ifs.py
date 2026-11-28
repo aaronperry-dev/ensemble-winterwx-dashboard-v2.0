@@ -14,6 +14,7 @@ import threading
 import numpy as np
 
 from . import config as C
+from . import tempext
 from .bourgouin import es_water
 from .grib import decode_messages
 from .http import HttpClient, NotAvailable, SourceError
@@ -21,7 +22,8 @@ from .idx import split_grib_messages
 
 log = logging.getLogger("gefs.ifs")
 
-SURFACE_PARAMS = ("2t", "2d", "sp", "tp")
+SURFACE_PARAMS = ("2t", "2d", "sp", "tp",
+                  "mx2t3", "mn2t3", "mx2t6", "mn2t6")     # the last four: maximum / minimum 2 m temperature over the last 3 h (to F144) or 6 h (after)
 
 
 def _stem(date: str, cycle: str, step: int) -> str:
@@ -133,8 +135,10 @@ class IfsChain:
         for s in self.sources:
             try:
                 msgs = s.messages(date, cycle, fhr, number, self.levels)
-                arrs, window = decode_messages(msgs, self.domain)
+                wins: dict = {}
+                arrs, window = decode_messages(msgs, self.domain, wins)
                 fields, window = to_fields(arrs, window, self.levels)
+                tempext.attach(fields, arrs, wins)              # the 3- or 6-hour maximum / minimum 2 m temperature, when this step has it
                 return fields, window, {"ifs": s.name}
             except NotAvailable as e:
                 errors.append(f"{s.name}: not available")

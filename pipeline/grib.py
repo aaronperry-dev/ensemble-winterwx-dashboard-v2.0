@@ -16,17 +16,24 @@ except ImportError:  # pragma: no cover
 def identify(msg) -> tuple[str, tuple[int, int] | None] | None:
     """Map a GRIB message to (internal key, accumulation window) or None if unwanted.
 
-    Keys: T<hPa>, RH<hPa>, T2, RH2, PS, APCP.  Uses WMO discipline/category/number so it works
-    the same for every source.
+    Keys: T<hPa>, RH<hPa>, T2, RH2, PS, APCP, and the 2 m window extremes TMAX / TMIN (with their (start, end) window).
+    Uses WMO discipline/category/number so it works the same for every source.
     """
     disc, cat, num = msg["discipline"], msg["parameterCategory"], msg["parameterNumber"]
     tol, lev = msg.typeOfLevel, msg.level
     if disc != 0:
         return None
+    if (cat, num) in ((0, 4), (0, 5)) and tol == "heightAboveGround" and lev == 2:   # NCEP and ECCC: maximum / minimum temperature
+        return ("TMAX" if num == 4 else "TMIN"), (int(msg["startStep"]), int(msg["endStep"]))
     if (cat, num) == (0, 0):          # temperature
         if tol == "isobaricInhPa":
             return f"T{int(lev)}", None
         if tol == "heightAboveGround" and lev == 2:
+            # ECMWF writes its 3- and 6-hour maximum / minimum 2 m temperature (mx2t3, mn2t6, ...) with the same parameter
+            # numbers as the instantaneous 2 m temperature, and tells them apart only by the statistical processing
+            step_type = msg["stepType"] if msg.has_key("stepType") else "instant"
+            if step_type in ("max", "min"):
+                return ("TMAX" if step_type == "max" else "TMIN"), (int(msg["startStep"]), int(msg["endStep"]))
             return "T2", None
     elif (cat, num) == (0, 6) and tol == "heightAboveGround" and lev == 2:    # 2 m dew point (ECMWF sends this, not RH)
         return "TD2", None
@@ -85,8 +92,9 @@ class Cropper:
         return np.ascontiguousarray(vals[rows][:, cols])
 
 
-def decode_messages(messages: list[bytes], domain: C.Domain) -> tuple[dict[str, np.ndarray], tuple[int, int] | None]:
-    """Decode raw GRIB messages -> {key: float32[ny, nx]} plus the APCP accumulation window."""
+def decode_messages(messages: list[bytes], domain: C.Domain, windows: dict | None = None) -> tuple[dict[str, np.ndarray], tuple[int, int] | None]:
+    """Decode raw GRIB messages -> {key: float32[ny, nx]} plus the APCP accumulation window.
+    `windows`, if given, is filled with {key: (start, end)} for every field that has one (APCP, TMAX, TMIN)."""
     if pygrib is None:  # pragma: no cover
         raise RuntimeError("pygrib is required: pip install pygrib")
     cropper = Cropper(domain)
@@ -102,12 +110,16 @@ def decode_messages(messages: list[bytes], domain: C.Domain) -> tuple[dict[str, 
             continue
         out[key] = cropper.crop(msg)
         if win is not None:
-            window = win
+            if windows is not None:
+                windows[key] = win
+            if key == "APCP":
+                window = win
     return out, window
 
 
-def decode_members(messages: list[bytes], domain: C.Domain) -> tuple[dict[str, dict[int, np.ndarray]], tuple[int, int] | None]:
-    """Decode a file that holds every ensemble member (the GEPS layout) -> {key: {perturbation number: float32[ny, nx]}}."""
+def decode_members(messages: list[bytes], domain: C.Domain, windows: dict | None = None) -> tuple[dict[str, dict[int, np.ndarray]], tuple[int, int] | None]:
+    """Decode a file that holds every ensemble member (the GEPS layout) -> {key: {perturbation number: float32[ny, nx]}}.
+    `windows` is filled as in decode_messages."""
     if pygrib is None:  # pragma: no cover
         raise RuntimeError("pygrib is required: pip install pygrib")
     cropper = Cropper(domain)
@@ -124,5 +136,8 @@ def decode_members(messages: list[bytes], domain: C.Domain) -> tuple[dict[str, d
             continue
         out[key][n] = cropper.crop(msg)
         if win is not None:
-            window = win
+            if windows is not None:
+                windows[key] = win
+            if key == "APCP":
+                window = win
     return out, window

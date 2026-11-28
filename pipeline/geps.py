@@ -12,6 +12,7 @@ import logging
 import numpy as np
 
 from . import config as C
+from . import tempext
 from .grib import decode_members
 from .http import HttpClient, NotAvailable, SourceError
 from .idx import split_grib_messages
@@ -19,10 +20,14 @@ from .idx import split_grib_messages
 log = logging.getLogger("gefs.geps")
 
 
-def file_specs(levels) -> list[tuple[str, str]]:
-    """[(variable, level code)] for one forecast hour."""
+EXTREME_FILES = (("TMAX", "TGL_2m"), ("TMIN", "TGL_2m"))     # 6-hour maximum / minimum 2 m temperature, published at the 6-hourly hours only
+
+
+def file_specs(levels, extremes: bool = False) -> list[tuple[str, str]]:
+    """[(variable, level code)] for one forecast hour.  The 2 m extremes come last and are optional."""
     specs = [("TMP", f"ISBL_{int(l):04d}") for l in levels] + [("RH", f"ISBL_{int(l):04d}") for l in levels]
-    return specs + [("TMP", "TGL_2m"), ("RH", "TGL_2m"), ("PRES", "SFC_0"), ("APCP", "SFC_0")]
+    specs += [("TMP", "TGL_2m"), ("RH", "TGL_2m"), ("PRES", "SFC_0"), ("APCP", "SFC_0")]
+    return specs + (list(EXTREME_FILES) if extremes else [])
 
 
 class GepsChain:
@@ -46,12 +51,22 @@ class GepsChain:
     def fetch_step(self, date: str, cycle: str, fhr: int, allow_origin: bool = True):
         """-> ({member index: fields}, (a, b) accumulation window, {"geps": "msc"})."""
         merged: dict[str, dict[int, np.ndarray]] = {}
-        window = None
-        for var, level in file_specs(self.levels):
-            blob = self.http.get_bytes(self.url(date, cycle, fhr, var, level), self.gate, missing_statuses=(404,))
+        window, wins = None, {}
+        for var, level in file_specs(self.levels, tempext.wanted("geps", fhr)):
+            optional = (var, level) in EXTREME_FILES
             try:
-                arrs, win = decode_members(split_grib_messages(blob), self.domain)
+                blob = self.http.get_bytes(self.url(date, cycle, fhr, var, level), self.gate, missing_statuses=(404,))
+            except (NotAvailable, SourceError) as e:
+                if not optional:
+                    raise
+                log.warning("GEPS f%03d: no %s file (%s); no daily extremes for this block", fhr, var, e)    # never stalls the run
+                continue
+            try:
+                arrs, win = decode_members(split_grib_messages(blob), self.domain, wins)
             except ValueError as e:
+                if optional:
+                    log.warning("GEPS f%03d: unreadable %s file (%s)", fhr, var, e)
+                    continue
                 raise SourceError(f"msc: {e}") from e
             for k, v in arrs.items():
                 merged.setdefault(k, {}).update(v)
@@ -71,5 +86,6 @@ class GepsChain:
             for l in self.levels:
                 f[f"RH{l}"] = np.clip(f[f"RH{l}"], 0.0, 100.0)
             f["RH2"] = np.clip(f["RH2"], 0.0, 100.0)
+            tempext.attach(f, {k: merged.get(k, {}).get(n) for k in ("TMAX", "TMIN")}, wins)
             out[n] = f
         return out, tuple(window), {"geps": "msc"}

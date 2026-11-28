@@ -18,12 +18,13 @@ import numpy as np
 import requests
 
 from . import config as C
-from . import encode
+from . import encode, tempext
 
 log = logging.getLogger("gefs.reuse")
 ROOT = Path(__file__).resolve().parent
 # Files whose contents change the numbers we publish.  Transport code (sources, http, ratelimit) and site assembly do not.
-REV_FILES = ("bourgouin.py", "config.py", "encode.py", "families.py", "geps.py", "grib.py", "ifs.py", "member.py", "products.py", "run.py")
+REV_FILES = ("bourgouin.py", "config.py", "encode.py", "families.py", "geps.py", "grib.py", "ifs.py", "member.py", "products.py", "run.py",
+             "tempext.py")
 
 
 def code_rev() -> str:
@@ -55,6 +56,31 @@ def _check_file(path: Path, kind: int, fhr: int, nmem: int) -> bool:
     except Exception:  # noqa: BLE001 - truncated gzip, bad magic, wrong size: all mean "do not trust it"
         return False
     return d["kind"] == kind and d["fhr"] == fhr and d["nmem"] == nmem
+
+
+def align_to_blocks(prior: dict, cyc=None, fhrs: list[int] | None = None) -> None:
+    """Cut a partly published cycle back to a point from which the daily extremes can be continued.
+
+    They are built from 6-hour blocks (IFS: from two 3-hour windows), so resuming in the middle of one would lose its first half.
+    Also, a MaxT / MinT window that has blocks among the reused hours but no entry in the published listing (the earlier run was
+    planned for a shorter forecast, say) cannot be rebuilt from files, so the run goes back to where that window starts."""
+    steps = prior["steps"]
+    while steps and steps[-1]["fhr"] % C.TEMP_BLOCK_H:
+        steps.pop()
+    if cyc is None or not steps:
+        return
+    listed = {(p, e["date"]) for p in tempext.PRODUCTS for e in (prior.get("temps") or {}).get(p, [])}
+    last, cut = steps[-1]["fhr"], None
+    planned = [(p, d) for p, ds in tempext.plan(cyc, fhrs or []).items() for d in ds]
+    for key in planned:
+        if key in listed:
+            continue
+        starts = [b - C.TEMP_BLOCK_H for b in range(C.TEMP_BLOCK_H, last + 1, C.TEMP_BLOCK_H) if tempext.locate(cyc, b - C.TEMP_BLOCK_H) == key]
+        if starts:
+            cut = min(starts) if cut is None else min(cut, min(starts))
+    if cut is not None:
+        while steps and steps[-1]["fhr"] > cut:
+            steps.pop()
 
 
 def load_prior(base_url: str, run_dir: Path, cyc, members: list[str], domain: C.Domain, slr_mode: str,
@@ -109,8 +135,18 @@ def load_prior(base_url: str, run_dir: Path, cyc, members: list[str], domain: C.
         return (pull(st["cum"]) and _check_file(run_dir / st["cum"], encode.KIND_CUM, st["fhr"], nmem)
                 and pull(st["ptype"]) and _check_file(run_dir / st["ptype"], encode.KIND_PTYPE, st["fhr"], nmem))
 
+    temps = man.get("temps") or {}
+    tdays = [d for k in ("tmax", "tmin") for d in temps.get(k, []) if d.get("file")]
+
+    def fetch_day(d: dict) -> bool:                                 # daily extremes: the running maximum / minimum of each window
+        return pull(d["file"]) and _check_file(run_dir / d["file"], encode.KIND_TEMP, int(d["index"]), len(members))
+
     with cf.ThreadPoolExecutor(8) as ex:
         ok = list(ex.map(fetch_step, steps))
+        t_ok = all(ex.map(fetch_day, tdays))
+    if not t_ok:
+        log.warning("reuse: a published daily-temperature file is missing or damaged; not reusing this cycle")
+        return None
     good = 0
     while good < len(ok) and ok[good]:
         good += 1
@@ -121,12 +157,14 @@ def load_prior(base_url: str, run_dir: Path, cyc, members: list[str], domain: C.
     if not steps:
         return None
     return {"steps": steps, "dropped": man.get("dropped", {}), "sources_used": man.get("sources_used", {}),
-            "complete": len(steps) == len(fhrs)}
+            "complete": len(steps) == len(fhrs), "temps": temps}
 
 
-def seed(prior: dict, run_dir: Path, acc, cum_x: dict, carry: dict | None = None, keep_hours: int = 24) -> None:
+def seed(prior: dict, run_dir: Path, acc, cum_x: dict, carry: dict | None = None, keep_hours: int = 24, temps=None) -> None:
     """Restore the running accumulators from published files so the next hour can be added to them."""
     last = prior["steps"][-1]["fhr"]
+    if temps is not None:
+        temps.restore(prior.get("temps") or {}, run_dir, last)
     for st in prior["steps"]:
         if st["fhr"] >= last - keep_hours:                        # same horizon finalize_step keeps in memory
             acc.cum[st["fhr"]] = encode.read_bin(run_dir / st["cum"])["qpf_mm"].copy()

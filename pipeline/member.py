@@ -4,6 +4,7 @@ from __future__ import annotations
 import numpy as np
 
 from . import config as C
+from . import tempext
 from .bourgouin import classify_profiles
 from .grib import decode_messages
 from .http import SourceError
@@ -11,21 +12,27 @@ from .sources import SourceChain, Target, required_fields
 
 
 def fetch_fields(chain: SourceChain, date: str, cycle: str, member: str, fhr: int,
-                 levels=C.PLEVELS, domain: C.Domain | None = None, allow_origin: bool = True):
-    """Download + decode all required fields. Returns (fields, apcp_window, {a|b: source})."""
+                 levels=C.PLEVELS, domain: C.Domain | None = None, allow_origin: bool = True, extremes: bool = False):
+    """Download + decode all required fields. Returns (fields, apcp_window, {a|b: source}).
+    With `extremes`, `fields` may also hold TMAX / TMIN (2 m window extremes) and TWIN, their (start, end) hours."""
     domain = domain or C.Domain()
-    specs = required_fields(levels)
+    specs = required_fields(levels, extremes)
     fields: dict[str, np.ndarray] = {}
+    wins: dict = {}
     window, used = None, {}
     for kind in ("a", "b"):
         sp = [s for s in specs if s.file == kind]
         if not sp:
             continue
         msgs, src = chain.fetch(Target(date, cycle, member, fhr, kind), sp, allow_origin=allow_origin)
-        arrs, win = decode_messages(msgs, domain)
+        arrs, win = decode_messages(msgs, domain, wins)
         fields.update(arrs)
         used[kind] = src
         window = win or window
+    tempext.attach(fields, fields, wins)
+    for k in ("TMAX", "TMIN"):
+        if k in fields and tempext.TWIN not in fields:
+            del fields[k]                                  # a lone or mismatched extreme is of no use
     missing = [s.key for s in specs if s.key not in fields and not s.optional]
     if missing:
         raise SourceError(f"{member} f{fhr:03d}: decoded GRIB is missing {missing}")

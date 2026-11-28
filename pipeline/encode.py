@@ -4,19 +4,19 @@ File layout (little-endian), 64-byte header then raw arrays:
 
   offset  type   field
   0       4s     magic  b"GWX1"
-  4       u8     kind   1 = cumulative totals, 2 = precipitation-type probabilities
-  5       u8     narr    kind 1: number of cumulative u16 arrays that follow (4; files with 0 hold 2)
+  4       u8     kind   1 = cumulative totals, 2 = precipitation-type probabilities, 3 = a daily maximum or minimum temperature
+  5       u8     narr    kind 1: number of cumulative u16 arrays that follow (4; files with 0 hold 2);  kind 3: 1
   6       u16    nmem   number of ensemble members (31)
   8       u16    ny     rows  (north -> south)
   10      u16    nx     cols  (west -> east)
-  12      u16    fhr    forecast hour
-  14      u16    step_h hours since the previous written step
+  12      u16    fhr    forecast hour  (kind 3: index of the day, in the order the manifest lists them)
+  14      u16    step_h hours since the previous written step  (kind 3: how many 6-hour blocks the window holds)
   16      f32    lat_north (center of first row)
   20      f32    lon_west  (center of first column, degrees east, -180..180)
   24      f32    dlat
   28      f32    dlon
-  32      f32    scale0  kind 1: mm of liquid per count (QPF)
-  36      f32    scale1  kind 1: cm of snow per count
+  32      f32    scale0  kind 1: mm of liquid per count (QPF);  kind 3: deg C per count (0.05)
+  36      f32    scale1  kind 1: cm of snow per count;  kind 3: deg C at count 0 (the offset, -100)
   40      f32    scale2  kind 1: mm of liquid per count, freezing rain
   44      f32    scale3  kind 1: mm of liquid per count, sleet / ice pellets
   48      u32    member bitmask, members 0-31: bit k set = member k (c00, p01 ...) has data in this file. 0 = legacy file, all present
@@ -28,6 +28,8 @@ File layout (little-endian), 64-byte header then raw arrays:
                Any rolling window total is  cum(t) - cum(t - window)  -- two small files.
  kind 2 body:  u8  [4][nmem][ny][nx]   probabilities (0-100) of RA, SN, FZRA, PL.
                All zero where that member has no precipitation in the 3-h step.
+ kind 3 body:  u16 [nmem][ny][nx]   one window's maximum (or minimum) 2 m temperature of every member: deg C = scale1 + count * scale0.
+               Which of the two it is, and which window, is in the manifest.  A member absent from the bitmask has an all-zero plane.
 """
 from __future__ import annotations
 
@@ -42,7 +44,7 @@ from . import config as C
 MAGIC = b"GWX1"
 HEADER = struct.Struct("<4sBBHHHHHffffffffIfI")     # ... mask (members 0-31), the 5th scale (snow liquid equivalent), mask (members 32-63)
 HEADER_SIZE = 64
-KIND_CUM, KIND_PTYPE = 1, 2
+KIND_CUM, KIND_PTYPE, KIND_TEMP = 1, 2, 3
 
 
 def full_mask(nmem: int) -> int:
@@ -103,6 +105,21 @@ def write_ptype(path: Path, fhr: int, step_h: int, probs_u8: np.ndarray, domain:
     return _write_gz(Path(path), hdr + body)
 
 
+def quantize_temp_k(t_k: np.ndarray) -> np.ndarray:
+    """Kelvin -> uint16 counts (deg C = offset + count * step).  NaN and out-of-range values become 0 = no data."""
+    c = (np.asarray(t_k, np.float32) - np.float32(273.15) - np.float32(C.TEMP_C_OFFSET)) / np.float32(C.TEMP_C_PER_COUNT)
+    ok = np.isfinite(c) & (c >= 1) & (c <= 65535)
+    return np.where(ok, np.rint(np.where(ok, c, 0.0)), 0).astype("<u2")
+
+
+def write_temps(path: Path, day_index: int, blocks: int, t_k: np.ndarray, domain: C.Domain, mask: int | None = None) -> int:
+    """One window's maximum (or minimum) 2 m temperature (Kelvin, (nmem, ny, nx)) for every member."""
+    m, ny, nx = t_k.shape
+    hdr = _header(KIND_TEMP, m, ny, nx, day_index, blocks, domain, scales=(C.TEMP_C_PER_COUNT, C.TEMP_C_OFFSET, 0.0, 0.0, 0.0),
+                  narr=1, mask=full_mask(m) if mask is None else mask)
+    return _write_gz(Path(path), hdr + quantize_temp_k(t_k).tobytes())
+
+
 def read_bin(path: Path) -> dict:
     """Reference reader (used by tests; the browser has its own JS reader)."""
     raw = gzip.open(path, "rb").read()
@@ -124,6 +141,10 @@ def read_bin(path: Path) -> dict:
             out["pl_mm"] = arrs[3].astype(np.float32) * s3
         if narr >= 5:
             out["swe_mm"] = arrs[4].astype(np.float32) * s4
+    elif kind == KIND_TEMP:
+        a = np.frombuffer(raw, "<u2", n, off).reshape(nmem, ny, nx)
+        out["day"], out["blocks"] = fhr, step_h
+        out["t_c"] = np.where(a > 0, s1 + a.astype(np.float32) * s0, np.nan).astype(np.float32)
     else:
         out["probs"] = np.frombuffer(raw, np.uint8, 4 * n, off).reshape(4, nmem, ny, nx)
     return out

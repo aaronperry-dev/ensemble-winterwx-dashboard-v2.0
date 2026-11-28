@@ -31,7 +31,7 @@ from pathlib import Path
 import numpy as np
 
 from . import config as C
-from . import encode, families, geps, ifs, reuse
+from . import encode, families, geps, ifs, reuse, tempext
 from .http import HttpClient, NotAvailable, SourceError
 from .member import compute_member_step, cpofp_from, fetch_fields
 from .products import (ApcpAccumulator, cap_freezing_rain, snowfall_step_cm, step_average_shares, surface_temperature_gates,
@@ -65,7 +65,8 @@ def init_worker(cfg: dict) -> None:
 def _member_result(base: dict, fam: families.Family, fields: dict, window, used, slr_mode: str) -> dict:
     probs, slr = compute_member_step(fields, levels=fam.levels, slr_mode=slr_mode)
     return {**base, "status": "ok", "window": window, "apcp": fields["APCP"], "probs": probs, "slr": slr,
-            "cpofp": cpofp_from(fields) if fam.uses_cpofp else None, "t2": fields["T2"], "sources": used}
+            "cpofp": cpofp_from(fields) if fam.uses_cpofp else None, "t2": fields["T2"], "sources": used,
+            "tmax": fields.get("TMAX"), "tmin": fields.get("TMIN"), "twin": fields.get(tempext.TWIN)}
 
 
 def run_task(task: tuple[str, str, str, int]) -> dict:
@@ -83,7 +84,8 @@ def run_task(task: tuple[str, str, str, int]) -> dict:
             fields, window, used = chain.fetch_member_step(date, cycle, unit, fhr, allow_origin=allow_origin)
         else:
             fields, window, used = fetch_fields(chain, date, cycle, unit, fhr, levels=fam.levels,
-                                               domain=C.Domain(**cfg["domain"]), allow_origin=allow_origin)
+                                               domain=C.Domain(**cfg["domain"]), allow_origin=allow_origin,
+                                               extremes=tempext.wanted(fam.key, fhr))
         return _member_result(base, fam, fields, window, used, cfg["slr_mode"])
     except NotAvailable as e:
         return {**base, "status": "unavailable", "msg": str(e)}
@@ -206,7 +208,12 @@ def run(args, task_fn=None, executor=None) -> int:
                       cf.ProcessPoolExecutor(max_workers=args.workers, initializer=init_worker, initargs=(cfg,)))
     task = task_fn or run_task
 
+    if prior and not prior["complete"]:
+        reuse.align_to_blocks(prior, cyc, fhrs)                 # resume at the end of a 6-hour block so no half-built block is lost
+        if not prior["steps"]:
+            prior = None
     acc = ApcpAccumulator(len(members), domain.ny, domain.nx)
+    temps = tempext.DailyExtremes(cyc, fhrs, len(members), domain.ny, domain.nx)       # daily max / min 2 m temperature
     cum_x = {k: np.zeros((len(members), domain.ny, domain.nx), np.float32) for k in ("snow", "zr", "pl", "swe")}
     carry: dict = {"probs": None}            # previous step's type probabilities (for the start-of-step end of the average)
     steps: list[dict] = []
@@ -225,7 +232,7 @@ def run(args, task_fn=None, executor=None) -> int:
     head_since = t_start
     fatal = None
     if prior:
-        reuse.seed(prior, run_dir, acc, cum_x, carry)
+        reuse.seed(prior, run_dir, acc, cum_x, carry, temps=temps)
         steps.extend(prior["steps"])
         dropped.update(prior["dropped"])
         alive -= set(dropped)
@@ -250,14 +257,14 @@ def run(args, task_fn=None, executor=None) -> int:
             "init": cyc.strftime("%Y-%m-%dT%H:%M:%SZ"), "run": run_id, "base": f"{run_id}/",
             "complete": complete, "members": members, "domain": domain.to_dict(),
             "ptype_order": ["RA", "SN", "FZRA", "PL"],
-            "products": ["qpf", "snow", "zr", "pl", "ptype"],
+            "products": ["qpf", "snow", "zr", "pl", "ptype"] + (["tmax", "tmin"] if temps.available() else []),
             "scales": {"qpf_mm_per_count": C.QPF_MM_PER_COUNT, "snow_cm_per_count": C.SNOW_CM_PER_COUNT,
                        "zr_mm_per_count": C.ZR_MM_PER_COUNT, "pl_mm_per_count": C.PL_MM_PER_COUNT,
                        "swe_mm_per_count": C.SWE_MM_PER_COUNT},
             "slr_mode": args.slr_mode, "min_precip_mm": C.MIN_PRECIP_MM, "code_rev": reuse.code_rev(),
             "reused_hours": len(prior["steps"]) if prior else 0,
             "min_members": pol.min_members, "dropped": dropped,
-            "sources_used": src_counts, "steps": steps,
+            "sources_used": src_counts, "steps": steps, "temps": temps.manifest(),
         }
         out.mkdir(parents=True, exist_ok=True)
         tmp = out / (manifest_name + ".tmp")
@@ -328,7 +335,7 @@ def run(args, task_fn=None, executor=None) -> int:
                 continue
             if act == "ready":
                 total_bytes += finalize_step(fhr, fhrs[head - 1] if head else 0, members, flatten_results(st["res"]), acc,
-                                             cum_x, run_dir, domain, steps, cyc, carry)
+                                             cum_x, run_dir, domain, steps, cyc, carry, temps)
                 state[fhr] = {"res": {}, "err": {}, "failed": set()}
                 write_manifest(False)
                 log.info("f%03d done (%d/%d, %d members)  %.0fs elapsed", fhr, head + 1, len(fhrs), steps[-1]["n"],
@@ -350,7 +357,7 @@ def run(args, task_fn=None, executor=None) -> int:
     return 0 if steps else 2
 
 
-def finalize_step(fhr, prev_fhr, members, res, acc, cum_x, run_dir, domain, steps, cyc, carry=None) -> int:
+def finalize_step(fhr, prev_fhr, members, res, acc, cum_x, run_dir, domain, steps, cyc, carry=None, temps=None) -> int:
     """Write one forecast hour.  `res` holds results only for the members present at this hour; the others keep
     zeros in every array and are flagged absent in the file header's member mask."""
     present = [m for m in members if m in res]
@@ -396,6 +403,11 @@ def finalize_step(fhr, prev_fhr, members, res, acc, cum_x, run_dir, domain, step
         arr[absent] = 0.0                                                 # keep dropped members' planes empty
     n = encode.write_cum(run_dir / "cum" / f"f{fhr:03d}.bin.gz", fhr, fhr - prev_fhr, cum_q, cs, domain, cz, cp, mask, swe_cum_mm=cw)
     n += encode.write_ptype(run_dir / "ptype" / f"f{fhr:03d}.bin.gz", fhr, fhr - prev_fhr, probs, domain, mask)
+    if temps is not None:                                                 # daily maximum / minimum 2 m temperature
+        got = {i: (res[m]["tmax"], res[m]["tmin"], tuple(int(v) for v in res[m]["twin"]))
+               for i, m in zip(idx, present) if res[m].get("tmax") is not None and res[m].get("twin") is not None}
+        for label in temps.step(fhr, got):
+            n += temps.write_day(run_dir, label, domain)
     steps.append({
         "fhr": fhr, "step_h": fhr - prev_fhr, "n": len(present), "mask": mask,
         "valid": (cyc + dt.timedelta(hours=fhr)).strftime("%Y-%m-%dT%H:%M:%SZ"),

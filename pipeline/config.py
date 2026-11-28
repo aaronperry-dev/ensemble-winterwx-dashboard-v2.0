@@ -82,6 +82,18 @@ CPOFP_CAP_MIN_PCT = 90.0   # the model's liquid-fraction cap on freezing rain ap
 FZRA_MAX_T2_C = 1.0    # freezing rain needs a (near-)freezing surface: above this 2 m temperature its share becomes rain
 PL_MAX_T2_C = 3.0      # ice pellets survive to the surface only in cold air (RAP/HRRR use <= 3 C): above this their share becomes rain
 
+# --------------------------------------------------------------------------- daily maximum / minimum temperature
+# The models publish true maximum / minimum 2 m temperature over a window (GEFS and GEPS: 6 h, IFS ENS: 3 h to F144 and 6 h
+# after), so nothing is estimated from the 3-hourly instantaneous values, which would miss the peaks.  The daily values follow
+# the NWS convention for Eastern time, in fixed UTC windows (the same in every column of the domain):
+#   MaxT of a date = highest 2 m temperature from 12Z to 00Z  (7 am to 7 pm EST)
+#   MinT of a date = lowest 2 m temperature from 00Z to 12Z   (7 pm the evening before to 7 am EST), the overnight low
+# Only complete windows are published (two 6-hour blocks each), so a run's first or last half-covered window is left out.
+TEMP_BLOCK_H = 6
+TEMP_WINDOWS_UTC = {"tmax": (12, 24), "tmin": (0, 12)}     # product -> (first hour, hour after the last) of the UTC day
+TEMP_C_PER_COUNT = 0.05      # uint16 counts: deg C = TEMP_C_OFFSET + count * TEMP_C_PER_COUNT  (0 = no data)
+TEMP_C_OFFSET = -100.0
+
 # --------------------------------------------------------------------------- data sources
 S3_BASE = "https://noaa-gefs-pds.s3.amazonaws.com"
 GCS_BASE = "https://storage.googleapis.com/gfs-ensemble-forecast-system"
