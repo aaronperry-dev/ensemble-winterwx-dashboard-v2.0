@@ -44,6 +44,7 @@ const S = {
   sets: {}, fam: 'blend', wmode: 'model', note: '',          // loaded manifests; selected model; blend weighting
   src: [], all: [], off: {}, init: '', domain: null, gen: '', complete: true, products: null,
   steps: [], byFhr: new Map(), idx: 0,
+  tdays: {}, day: '',                                       // daily MaxT / MinT: per product, the dates every pooled model has; the selected date
   product: 'qpf', period: 24, stat: 'mean', lpmmR: 4, slr: 'kuchera', hasSwe: false, opacity: 0.82,
   cur: null, token: 0, pin: null, playing: false, timer: null,
 };
@@ -55,7 +56,7 @@ const BUDGET = (navigator.deviceMemory && navigator.deviceMemory <= 4 ? 90 : 220
 function cached(url, make) {
   if (CACHE.has(url)) { const p = CACHE.get(url); CACHE.delete(url); CACHE.set(url, p); return p; }
   const p = make().then((o) => {
-    SIZES.set(url, (o.q || o.p).buffer.byteLength);
+    SIZES.set(url, (o.q || o.p || o.t).buffer.byteLength);
     let tot = 0; SIZES.forEach((v) => (tot += v));
     for (const k of CACHE.keys()) { if (tot <= BUDGET || CACHE.size <= 8) break; if (k === url) continue; tot -= SIZES.get(k) || 0; CACHE.delete(k); SIZES.delete(k); }
     return o;
@@ -83,6 +84,7 @@ async function fetchBin(url) {
       const o = { h }; ['q', 's', 'z', 'p', 'w'].slice(0, h.narr).forEach((k, i) => { o[k] = new Uint16Array(buf, 64 + 2 * n * i, n); });
       return o;
     }
+    if (h.kind === 3) return { h, t: new Uint16Array(buf, 64, n) };          // daily max / min 2 m temperature, counts of s0 deg C from s1
     return { h, p: new Uint8Array(buf, 64, 4 * n) };
   });
 }
@@ -132,6 +134,57 @@ async function windowValues(kind, i, period, extra) {
     }
   }
   return { data: out, w, h: { ...parts[0].a.h, nmem: M }, members, weights, parts: parts.map((p) => ({ s: p.s, ks: p.ks, j0: p.j0 })) };
+}
+
+/* ---- daily maximum / minimum temperature (one file per product and date; values are deg F in memory) ---- */
+const tempMode = () => TempDays.isTemp(S.product);
+const currentDay = () => (S.tdays[S.product] || []).find((d) => d.date === S.day);
+const dayPos = () => Math.max(0, (S.tdays[S.product] || []).findIndex((d) => d.date === S.day));
+function fixDay() {                                 // keep the selected date valid for the product / model in view
+  const d = S.tdays[S.product]; if (!d || !d.length || d.some((x) => x.date === S.day)) return;
+  S.day = d[TempDays.nearestDay(d, S.day || d[0].date)].date;
+}
+
+async function tempValues(kind, date) {
+  const day = (S.tdays[kind] || []).find((d) => d.date === date);
+  if (!day) throw new Error('that day is not available');
+  const loaded = await Promise.all(S.src.map(async (s, j) => ({ s, a: await fetchBin(s.base + day.entries[j].file) })));
+  const parts = [];
+  for (const { s, a } of loaded) {
+    if (a.h.kind !== 3) throw new Error(`unexpected file for ${FAMS[s.key].label}`);
+    const ks = EnsStats.membersFromMask(a.h.mask || 2 ** a.h.nmem - 1, a.h.nmem);
+    if (ks.length) parts.push({ s, a, ks });
+  }
+  if (!parts.length) throw new Error('no ensemble member has data for this day');
+  const N = parts[0].a.h.ny * parts[0].a.h.nx, M = parts.reduce((t, p) => t + p.ks.length, 0), out = new Float32Array(M * N);
+  const members = [], weights = parts.length > 1 && S.wmode === 'model' ? new Float32Array(M) : null;
+  let j = 0;
+  for (const p of parts) {
+    const h = p.a.h, f0 = h.s1 * 1.8 + 32, fs = h.s0 * 1.8, T = p.a.t;        // deg C = s1 + count * s0  ->  deg F
+    p.j0 = j;
+    for (const k of p.ks) {
+      const o = k * N, d = j * N;
+      for (let q = 0; q < N; q++) out[d + q] = f0 + T[o + q] * fs;
+      members.push(S.off[p.s.key] + k);
+      if (weights) weights[j] = 1 / (parts.length * p.ks.length);
+      j++;
+    }
+  }
+  return { data: out, w: { day: date, product: kind }, h: { ...parts[0].a.h, nmem: M }, members, weights, parts: parts.map((p) => ({ s: p.s, ks: p.ks, j0: p.j0 })) };
+}
+
+/** One deg F field from a day's member values: ensemble statistic, one member, or the chance of being at/below or at/above a threshold. */
+function reduceTemp(win, stat) {
+  const { nmem: M, ny, nx } = win.h, N = ny * nx, data = win.data, wt = win.weights;
+  if (isMem(stat) && win.members.includes(+stat.slice(1))) return data.slice(win.members.indexOf(+stat.slice(1)) * N, (win.members.indexOf(+stat.slice(1)) + 1) * N);
+  if (isMem(stat)) stat = 'mean';
+  const pr = TempDays.parseProb(stat);
+  if (pr) {
+    const [dir, thr] = pr, le = dir === 'le', out = new Float32Array(N);
+    for (let i = 0; i < N; i++) { let k = 0; for (let m = 0; m < M; m++) { const v = data[m * N + i]; if (le ? v <= thr : v >= thr) k += wt ? wt[m] : 1; } out[i] = wt ? 100 * k : (100 * k) / M; }
+    return out;
+  }
+  return EnsStats.compute(data, M, ny, nx, stat, { weights: wt });
 }
 
 const toDisp = (kind, v) => v / siPerIn(kind);   // raw (mm or cm) -> inches
@@ -222,7 +275,14 @@ function buildPtype(d, stat) {
 }
 
 /* ============================================================================= rendering */
+const PROB_COLD = ['#eff3ff', '#c6dbef', '#9ecae1', '#6baed6', '#4292c6', '#2171b5', '#08519c', '#08306b', '#041f4a'];
+const PROB_WARM = ['#fff5eb', '#fee6ce', '#fdd0a2', '#fdae6b', '#fd8d3c', '#f16913', '#d94801', '#a63603', '#7f2704'];
 function classesFor() {
+  if (tempMode()) {
+    if (!isProb(S.stat)) return { ...TempDays.CLASSES, title: TempDays.NAMES[S.product], temp: true };
+    const pr = TempDays.parseProb(S.stat) || ['ge', 0];
+    return { edges: PROB_EDGES, colors: pr[0] === 'le' ? PROB_COLD : PROB_WARM, labels: PROB_EDGES.map((e) => `${e}%+`), prob: true };
+  }
   if (isProb(S.stat)) {
     const k = PROB_RAMP[S.product] || ptypeProbColors(S.product === 'zr' ? 2 : S.product === 'pl' ? 3 : +S.stat.split(':')[1]);
     return { edges: PROB_EDGES, colors: k, labels: PROB_EDGES.map((e) => `${e}%+`), prob: true };
@@ -240,6 +300,11 @@ async function refresh() {
       if (isProb(S.stat)) { const c = classesFor(); wx.setClasses(c.edges, c.colors); }
       else wx.setPtypeLut(PTYPE.ramps, PTYPE.names, PTYPE.dbzMin, PTYPE.dbzStep);
       wx.setField(field, types); S.cur = { kind: 'ptype', d, field };
+    } else if (tempMode()) {
+      const win = await tempValues(S.product, S.day); if (tok !== S.token) return;
+      const field = reduceTemp(win, S.stat);
+      const c = classesFor(); wx.setClasses(c.edges, c.colors); wx.setField(field);
+      S.cur = { kind: S.product, win, field };
     } else {
       const win = await windowValues(S.product, S.idx, S.period); if (tok !== S.token) return;
       const field = await reduceStat(S.product, win, S.stat); if (tok !== S.token || !field) return;
@@ -255,9 +320,16 @@ async function refresh() {
  * Order: neighbouring hours for the current view, the start files of the other accumulation periods, then precip type. */
 let pfGen = 0, lastIdx = 0, dir = 1;
 function prefetch() {
-  if (S.idx !== lastIdx) dir = Math.sign(S.idx - lastIdx); lastIdx = S.idx;
+  const pos = tempMode() ? dayPos() : S.idx;
+  if (pos !== lastIdx) dir = Math.sign(pos - lastIdx) || dir; lastIdx = pos;
   const gen = ++pfGen, nav = navigator.connection || {};
   if (nav.saveData || /(^|-)2g$/.test(nav.effectiveType || '')) return;
+  if (tempMode()) {                                   // neighbouring days (travel direction first), then the same day of the other temperature product
+    const turls = [], days = S.tdays[S.product], i0 = dayPos(), other = S.tdays[S.product === 'tmax' ? 'tmin' : 'tmax'];
+    [1, 2, -1].map((d) => d * dir).forEach((d) => { const e = days[i0 + d]; if (e) e.entries.forEach((en, j) => turls.push(S.src[j].base + en.file)); });
+    const o = other && other.find((x) => x.date === S.day); if (o) o.entries.forEach((en, j) => turls.push(S.src[j].base + en.file));
+    return drain(gen, turls);
+  }
   const urls = [], add = (fhr) => { if (fhr != null && S.byFhr.has(fhr)) S.src.forEach((s) => urls.push(s.base + s.byFhr.get(fhr).cum)); };
   const addPt = (fhr) => { if (S.byFhr.has(fhr)) S.src.forEach((s) => urls.push(s.base + s.byFhr.get(fhr).ptype)); };
   const per = S.product === 'ptype' ? 'step' : S.period;
@@ -266,6 +338,9 @@ function prefetch() {
   [6, 12, 24, 48, 'step'].forEach((p) => { const w = windowFor(S.idx, p); if (w.start > 0) add(w.start); });
   addPt(here.fhr);
   [1, -1].forEach((d) => { const j = S.idx + d; if (j >= 0 && j < S.steps.length) addPt(S.steps[j].fhr); });
+  drain(gen, urls);
+}
+function drain(gen, urls) {
   const queue = [...new Set(urls)].filter((u) => !CACHE.has(u));
   const idle = window.requestIdleCallback || ((f) => setTimeout(f, 200));
   const next = () => idle(() => {
@@ -298,6 +373,8 @@ function statName() {
   if (s === 'lpmm') return `Local prob.-matched mean (LPMM \u00b1${lpmmMi()} mi)`;
   if (EnsStats.isPct(s)) return s === 'p50' ? '50th percentile (median)' : `${s.slice(1)}th percentile`;
   if (s === 'ens') return S.src.length > 1 ? 'Most likely type (blend)' : 'Most likely type (ensemble)';
+  const tp = TempDays.parseProb(s);
+  if (tp) return `Probability ${tp[0] === 'le' ? '\u2264' : '\u2265'} ${tp[1]}\u00b0F`;
   if (s.startsWith('prob:')) {
     const v = +s.slice(5);
     return S.product === 'ptype' ? `Probability of ${PTYPE.long[v].toLowerCase()}` : `Probability ≥ ${v}″`;
@@ -307,18 +384,33 @@ function statName() {
 }
 
 function updateWarn() {
-  const st = S.steps[S.idx], el = $('#t-warn'), bits = [];
-  S.src.forEach((s) => {
-    const part = st.parts[s.key], tot = s.man.members.length;
+  const tm = tempMode(), st = tm ? null : S.steps[S.idx], el = $('#t-warn'), bits = [];
+  S.src.forEach((s, j) => {
+    const part = tm ? currentDay().entries[j] : st.parts[s.key], tot = s.man.members.length;
     if (!part || part.n === undefined || part.n >= tot) return;
     const gone = s.man.members.filter((m, k) => part.mask && !(Math.floor(part.mask / 2 ** k) % 2)).join(', ');
     bits.push(`${S.src.length > 1 ? FAMS[s.key].label + ': ' : ''}${part.n} of ${tot} members (missing: ${gone})`);
   });
   if (!bits.length) { el.hidden = true; return; }
-  el.hidden = false; el.textContent = `\u26a0 ${bits.join('; ')} at this hour. Statistics use the members that are available.`;
+  el.hidden = false; el.textContent = `\u26a0 ${bits.join('; ')} ${tm ? 'for this day' : 'at this hour'}. Statistics use the members that are available.`;
+}
+
+function updateTempTitle() {
+  const day = currentDay(), [a, b] = TempDays.windowMs(S.product, S.day), A = new Date(a), B = new Date(b);
+  const hh = (d) => `${String(d.getUTCHours()).padStart(2, '0')}Z`, short = (d) => d.toLocaleTimeString([], { hour: 'numeric', timeZoneName: 'short' });
+  const n = day.entries.reduce((t, e) => t + e.n, 0);
+  $('#t-main').textContent = `${statName()} \u00b7 ${TempDays.NAMES[S.product]}`;
+  $('#t-valid').textContent = `${fmtLocal(A)} \u2192 ${fmtLocal(B)} (${fmtUtc(A)} \u2192 ${fmtUtc(B)})`;
+  $('#t-init').textContent = `${famTitle()} \u00b7 ${initTxt()} run \u00b7 ${n} members${S.src.length > 1 ? (S.wmode === 'model' ? ' \u00b7 models weighted equally' : ' \u00b7 members weighted equally') : ''}`;
+  updateWarn();
+  $('#fh').textContent = new Date(`${S.day}T12:00:00Z`).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric', timeZone: 'UTC' });
+  $('#fh-time').textContent = `${S.product === 'tmax' ? 'MaxT' : 'MinT'} ${hh(A)}\u2013${hh(B)}`;
+  $('#fh-utc').textContent = `${short(A)} \u2192 ${short(B)}`;
+  $('#slider').value = dayPos();
 }
 
 function updateTitle() {
+  if (tempMode()) return updateTempTitle();
   const st = S.steps[S.idx], valid = new Date(st.valid), init = new Date(S.init);
   const w = windowFor(S.idx, S.product === 'ptype' ? 'step' : S.period);
   const startD = new Date(init.getTime() + w.start * 3600e3);
@@ -354,6 +446,14 @@ function updateLegend() {
     note.textContent = 'dBZ ≈ rate from step QPF (rain/ice: Z=200R^1.6, snow: Z=1780R^2.21)'; el.appendChild(note); return;
   }
   const c = classesFor();
+  if (c.temp) {                                    // 30 WPC classes as one bar, warmest on top, labelled every 20 deg F
+    hdr.textContent = `${c.title} (\u00b0F)`;
+    const wrap = document.createElement('div'), bar = document.createElement('div'); wrap.className = 'tl'; bar.className = 'tl-bar';
+    for (let i = c.colors.length - 1; i >= 0; i--) { const q = document.createElement('i'); q.style.background = c.colors[i]; bar.appendChild(q); }
+    const ticks = document.createElement('div'), n = c.colors.length; ticks.className = 'tl-ticks';
+    for (let v = 100; v >= -40; v -= 20) { const t = document.createElement('span'); t.textContent = v; t.style.top = `${(((100 - v) / 5 + 1) / n) * 100}%`; ticks.appendChild(t); }
+    wrap.append(bar, ticks); el.appendChild(wrap); return;
+  }
   hdr.textContent = c.prob ? `Probability (% of ${stepN(S.idx)} members${S.src.length > 1 && S.wmode === 'model' ? ', models weighted equally' : ''})` :
     `${c.title} (in)`;
   for (let i = c.colors.length - 1; i >= 0; i--) {
@@ -388,11 +488,11 @@ function placeName(pt) {
 }
 
 /* Display precision: snowfall to tenths of an inch; QPF, freezing rain and sleet (liquid) to hundredths. */
-const fmtVal = (kind, inches) => `${inches.toFixed(kind === 'snow' ? 1 : 2)}″`;
+const fmtVal = (kind, inches) => (TempDays.isTemp(kind) ? `${inches.toFixed(1)}\u00b0F` : `${inches.toFixed(kind === 'snow' ? 1 : 2)}″`);   // temperatures to tenths
 
-function stripSVG(vals, mean, med, kind, selected, famOf) {
-  const W = 268, H = S.src.length > 1 ? 52 : 40, pad = 6, n = vals.length, mx = Math.max(...vals, 1e-9) * 1.04;
-  const sx = (v) => pad + (v / mx) * (W - 2 * pad), bins = new Map(), dots = [], step = n > 60 ? 4.4 : 5.2;
+function stripSVG(vals, mean, med, kind, selected, famOf, lo = 0, hi = null) {      // lo/hi: axis range (temperatures); precipitation runs 0..max
+  const W = 268, H = S.src.length > 1 ? 52 : 40, pad = 6, n = vals.length, mx = hi == null ? Math.max(...vals, 1e-9) * 1.04 : hi;
+  const sx = (v) => pad + ((v - lo) / (mx - lo || 1)) * (W - 2 * pad), bins = new Map(), dots = [], step = n > 60 ? 4.4 : 5.2;
   vals.forEach((v, m) => { const b = Math.round(sx(v) / 5); const k = bins.get(b) || 0; bins.set(b, k + 1); dots.push([sx(v), H - 8 - k * step, m]); });
   let s = `<svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="Ensemble member values">`;
   s += `<line x1="${pad}" x2="${W - pad}" y1="${H - 3}" y2="${H - 3}" stroke="#9aa3ab" stroke-width="1"/>`;
@@ -417,6 +517,7 @@ function tipHTML(ll, pt) {
   const head = `<div class="tip-h"><b>${nm.line1 || 'Open water / outside boundaries'}</b>${nm.line2 ? `<span>${nm.line2}</span>` : ''}
     <small>${Math.abs(ll.lat).toFixed(2)}°${ll.lat >= 0 ? 'N' : 'S'}, ${Math.abs(ll.lng).toFixed(2)}°${ll.lng >= 0 ? 'E' : 'W'}</small></div>`;
   if (cur.kind === 'ptype') return head + ptypeTip(ll, cur.d);
+  if (TempDays.isTemp(cur.kind)) return head + tempTip(ll, cur);
   const { win } = cur, M = win.h.nmem, N = win.h.ny * win.h.nx, cell = cellValues(ll, win.data, M, N, win.h);
   if (!cell) return head + '<div class="tip-b muted">Outside the domain.</div>';
   const wt = win.weights, wsum = wt ? Array.from(wt).reduce((a, b) => a + b, 0) : M;
@@ -445,6 +546,29 @@ function tipHTML(ll, pt) {
   h += `</div><div class="tip-s">All ${M} members <span class="key"><i class="k1"></i>mean <i class="k2"></i>median</span></div>${stripSVG(vals, mean, med, kind, sel, fi.famOf)}`;
   h += `<div class="tip-ax"><span>0</span><span>${f(Math.max(...vals))}</span></div>`;
   return h;
+}
+
+function tempTip(ll, cur) {
+  const { win } = cur, M = win.h.nmem, N = win.h.ny * win.h.nx, cell = cellValues(ll, win.data, M, N, win.h);
+  if (!cell) return '<div class="tip-b muted">Outside the domain.</div>';
+  const wt = win.weights, wsum = wt ? Array.from(wt).reduce((a, b) => a + b, 0) : M, kind = S.product, f = (x) => fmtVal(kind, x);
+  const vals = Array.from(cell.v), sorted = Float32Array.from(vals).sort(), lo = sorted[0], hi = sorted[M - 1];
+  const mean = wt ? vals.reduce((a, b, m) => a + b * wt[m], 0) / wsum : vals.reduce((a, b) => a + b, 0) / M;
+  const wp = (p) => (wt ? EnsStats.wPercentile(vals, wt, p) : pct(sorted, M, p)), med = wp(0.5);
+  const sel = isMem(S.stat) ? win.members.indexOf(+S.stat.slice(1)) : -1, val = { min: lo, max: hi, mean };
+  EnsStats.PCTS.forEach((p) => { val[`p${p}`] = wp(p / 100); });
+  const nm2 = (k) => (k === 'mean' ? 'Mean' : k === 'min' ? 'Min' : k === 'max' ? 'Max' : k.toUpperCase());
+  const ord = EnsStats.TIP_ORDER, half = ord.length / 2, fi = famInfo(win.members, vals, kind);
+  let h = `<div class="tip-t">${TempDays.NAMES[kind]} \u00b7 ${$('#fh').textContent} ${$('#fh-time').textContent.split(' ')[1]}</div><div class="tip-grid">`;
+  for (let r = 0; r < half; r++) h += `<span>${nm2(ord[r])}</span><b>${f(val[ord[r]])}</b><span>${nm2(ord[r + half])}</span><b>${f(val[ord[r + half]])}</b>`;
+  h += `</div>${fi.line}<div class="tip-s">Chance of</div><div class="tip-p">`;
+  TempDays.PROB[kind].forEach((pr) => {
+    let k = 0; vals.forEach((v, m) => { if (pr[0] === 'le' ? v <= pr[1] : v >= pr[1]) k += wt ? wt[m] : 1; });
+    const p = Math.round((100 * k) / wsum);
+    h += `<span>${TempDays.probLabel(pr)}</span><i><u style="width:${p}%"></u></i><b>${p}%</b>`;
+  });
+  h += `</div><div class="tip-s">All ${M} members <span class="key"><i class="k1"></i>mean <i class="k2"></i>median</span></div>${stripSVG(vals, mean, med, kind, sel, fi.famOf, lo, hi > lo ? hi : lo + 1)}`;
+  return h + `<div class="tip-ax"><span>${f(lo)}</span><span>${f(hi)}</span></div>`;
 }
 
 function ptypeTip(ll, d) {
@@ -528,6 +652,9 @@ function applySources(src) {
   S.gen = src.map((s) => s.man.generated).sort().pop();
   const sets = src.map((s) => new Set(s.man.products || ['qpf', 'snow', 'ptype']));
   S.products = [...sets[0]].filter((p) => sets.every((x) => x.has(p)));
+  S.tdays = {};                                   // dates every pooled model has complete, per temperature product
+  TempDays.PRODUCTS.forEach((p) => { S.tdays[p] = TempDays.commonDays(p, src.map((s) => s.man.temps)); });
+  S.products = S.products.filter((p) => !TempDays.isTemp(p) || S.tdays[p].length);
   S.hasSwe = src.every((s) => !!(s.man.scales && s.man.scales.swe_mm_per_count));
   if (src.length === 1) S.steps = src[0].steps.map((st) => ({ ...st, parts: { [src[0].key]: st } }));
   else {                                          // hours every selected model has; a step spans back to the previous shared hour
@@ -550,6 +677,7 @@ function setFamily(fam, quiet) {
   S.fam = fam; S.note = pick.note; applySources(pick.src);
   S.idx = nearestIdx(fhr);
   if (!S.products.includes(S.product)) S.product = 'qpf';
+  fixDay();
   if (!S.hasSwe) S.slr = 'kuchera';
   FIELD_MEMO.clear(); S.cur = null;
   return true;
@@ -567,11 +695,14 @@ function statOptions() {
   } else {
     g('Ensemble statistics', [['min', 'Minimum'], ['p5', '5th percentile'], ['p10', '10th percentile'], ['p25', '25th percentile'], ['p50', '50th percentile (median)'],
       ['mean', 'Mean'], ['p75', '75th percentile'], ['p90', '90th percentile'], ['p95', '95th percentile'], ['max', 'Maximum']]);
-    g('Probability-matched mean', [['pmm', 'PMM (whole map)'], ['lpmm', 'LPMM (local neighborhood)']]);
-    g('Probability of at least', PROB_THRESH[S.product].map((t) => [`prob:${t}`, `${t}″`]));
+    if (tempMode()) g('Probability', TempDays.PROB[S.product].map((pr) => [`prob:${pr[0]}:${pr[1]}`, `Chance ${TempDays.probLabel(pr)}`]));
+    else {
+      g('Probability-matched mean', [['pmm', 'PMM (whole map)'], ['lpmm', 'LPMM (local neighborhood)']]);
+      g('Probability of at least', PROB_THRESH[S.product].map((t) => [`prob:${t}`, `${t}″`]));
+    }
   }
-  S.src.forEach((s) => {
-    const here = EnsStats.membersFromMask(S.steps[S.idx].parts[s.key].mask, s.man.members.length);
+  S.src.forEach((s, j) => {
+    const here = EnsStats.membersFromMask(tempMode() ? currentDay().entries[j].mask : S.steps[S.idx].parts[s.key].mask, s.man.members.length);
     g(S.src.length > 1 ? `Single member \u2014 ${FAMS[s.key].label}` : 'Single member', here.map((k) => [`m${S.off[s.key] + k}`, s.man.members[k] === 'c00' ? 'Control (c00)' : `Member ${s.man.members[k]}`]));
   });
   return opts.join('');
@@ -593,19 +724,29 @@ function syncControls() {
     lpmm: `Same matching done separately inside a \u00b1${lpmmMi()}-mile neighborhood around each point: keeps local detail and avoids mixing different weather regimes.` }[S.stat];
   $('#stat-help').textContent = help || ''; $('#stat-help').hidden = !help;
   document.querySelectorAll('#product button').forEach((b) => b.classList.toggle('on', b.dataset.v === S.product));
-  document.querySelectorAll('#period button').forEach((b) => { b.classList.toggle('on', String(b.dataset.v) === String(S.period)); b.disabled = S.product === 'ptype' && b.dataset.v !== 'step'; });
-  $('#period-note').hidden = S.product !== 'ptype';
-  location.hash = `m=${S.fam}${S.src.length > 1 && S.wmode !== 'model' ? `&w=${S.wmode}` : ''}&p=${S.product}&per=${S.period}&s=${S.stat}${S.stat === 'lpmm' ? `&r=${S.lpmmR}` : ''}${S.product === 'snow' && S.hasSwe && S.slr !== 'kuchera' ? `&slr=${S.slr}` : ''}&f=${S.steps[S.idx].fhr}`;
+  document.querySelectorAll('#period button').forEach((b) => { b.classList.toggle('on', !tempMode() && String(b.dataset.v) === String(S.period)); b.disabled = tempMode() || (S.product === 'ptype' && b.dataset.v !== 'step'); });
+  $('#period-note').hidden = S.product !== 'ptype' && !tempMode(); $('#period-note').textContent = tempMode() ? '(not used: one value per day)' : '(type is per output step)';
+  location.hash = `m=${S.fam}${S.src.length > 1 && S.wmode !== 'model' ? `&w=${S.wmode}` : ''}&p=${S.product}${tempMode() ? '' : `&per=${S.period}`}&s=${S.stat}${S.stat === 'lpmm' ? `&r=${S.lpmmR}` : ''}${S.product === 'snow' && S.hasSwe && S.slr !== 'kuchera' ? `&slr=${S.slr}` : ''}${tempMode() ? `&d=${S.day.replace(/-/g, '')}` : `&f=${S.steps[S.idx].fhr}`}`;
 }
 
 function renderProducts() {
-  const have = new Set(S.products), el = $('#product'), html = [['qpf', 'QPF'], ['snow', 'Snowfall'], ['zr', 'Freezing rain'], ['pl', 'Sleet'], ['ptype', 'Precip type']].filter(([v]) => have.has(v)).map(([v, t]) => `<button data-v="${v}">${t}</button>`).join('');
+  const have = new Set(S.products), el = $('#product'), html = [['qpf', 'QPF'], ['snow', 'Snowfall'], ['zr', 'Freezing rain'], ['pl', 'Sleet'], ['ptype', 'Precip type'], ['tmax', 'Daily MaxT'], ['tmin', 'Daily MinT']].filter(([v]) => have.has(v)).map(([v, t]) => `<button data-v="${v}">${t}</button>`).join('');
   if (el.dataset.have !== html) { el.innerHTML = html; el.dataset.have = html; }
 }
 
 /** Day labels under the slider (they depend on which hours the selected model(s) have). */
 function buildDays() {
   const days = $('#days'); days.innerHTML = ''; let prev = '';
+  if (tempMode()) {                                // one tick per day (labelled by the UTC date the window starts on)
+    const d = S.tdays[S.product], every = innerWidth < 760 && d.length > 6 ? 2 : 1;
+    d.forEach((x, i) => {
+      if (i % every) return;
+      const sp = document.createElement('span'), fx = d.length > 1 ? i / (d.length - 1) : 0;
+      sp.textContent = new Date(`${x.date}T12:00:00Z`).toLocaleDateString([], { weekday: 'short', day: 'numeric', timeZone: 'UTC' });
+      sp.style.left = `${fx * 100}%`; if (fx > 0.93) sp.style.transform = 'translateX(-100%)'; days.appendChild(sp);
+    });
+    $('#slider').max = Math.max(0, d.length - 1); return;
+  }
   const every = innerWidth < 760 && S.steps.length > 40 ? 2 : 1; let nd = 0;
   S.steps.forEach((s, i) => { const d = new Date(s.valid), key = d.toDateString(); if (key !== prev) { prev = key; if (nd++ % every) return; const sp = document.createElement('span'); sp.textContent = d.toLocaleDateString([], { weekday: 'short', day: 'numeric' }); const fx = i / (S.steps.length - 1); sp.style.left = `${fx * 100}%`; if (fx > 0.93) sp.style.transform = 'translateX(-100%)'; days.appendChild(sp); } });
   $('#slider').max = S.steps.length - 1;
@@ -617,7 +758,7 @@ function buildUI() {
   $('#fam').onclick = (e) => { const b = e.target.closest('button'); if (!b || b.dataset.v === S.fam) return; if (setFamily(b.dataset.v)) { buildDays(); syncControls(); refresh(); } };
   $('#wmode').onchange = (e) => { S.wmode = e.target.value; FIELD_MEMO.clear(); syncControls(); refresh(); };
   $('#period').innerHTML = PERIODS.map(([v, t]) => `<button data-v="${v}">${t}</button>`).join('');
-  $('#product').onclick = (e) => { const b = e.target.closest('button'); if (!b) return; S.product = b.dataset.v; if (S.product === 'ptype') S.period = 'step'; else if (S.period === 'step') S.period = 24; syncControls(); refresh(); };
+  $('#product').onclick = (e) => { const b = e.target.closest('button'); if (!b) return; S.product = b.dataset.v; if (S.product === 'ptype') S.period = 'step'; else if (S.period === 'step') S.period = 24; fixDay(); buildDays(); syncControls(); refresh(); };
   $('#period').onclick = (e) => { const b = e.target.closest('button'); if (!b || b.disabled) return; S.period = b.dataset.v === 'step' ? 'step' : +b.dataset.v; syncControls(); refresh(); };
   $('#stat').onchange = (e) => { S.stat = e.target.value; syncControls(); refresh(); };
   $('#lpmm-r').onchange = (e) => { S.lpmmR = +e.target.value; syncControls(); refresh(); };
@@ -633,7 +774,7 @@ function buildUI() {
     map.fitBounds(v, { padding: 20, duration: 600 });
   };
   const sl = $('#slider');
-  sl.oninput = () => { S.idx = +sl.value; syncControls(); refresh(); };
+  sl.oninput = () => { if (tempMode()) S.day = S.tdays[S.product][+sl.value].date; else S.idx = +sl.value; syncControls(); refresh(); };
   $('#prev').onclick = () => step(-1); $('#next').onclick = () => step(1);
   $('#play').onclick = togglePlay;
   addEventListener('keydown', (e) => { if (/INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName) && document.activeElement.type !== 'range') return; if (e.key === 'ArrowRight') step(1); else if (e.key === 'ArrowLeft') step(-1); else if (e.key === ' ') { e.preventDefault(); togglePlay(); } });
@@ -642,11 +783,13 @@ function buildUI() {
   $('#legend-toggle').onclick = () => $('#legend').classList.toggle('min');
   buildDays();
 }
-function step(d) { const j = Math.max(0, Math.min(S.steps.length - 1, S.idx + d)); if (j === S.idx) { if (S.playing) togglePlay(); return; } S.idx = j; syncControls(); refresh(); }
+const navLen = () => (tempMode() ? S.tdays[S.product].length : S.steps.length), navPos = () => (tempMode() ? dayPos() : S.idx);
+function navSet(j) { if (tempMode()) S.day = S.tdays[S.product][j].date; else S.idx = j; }
+function step(d) { const j = Math.max(0, Math.min(navLen() - 1, navPos() + d)); if (j === navPos()) { if (S.playing) togglePlay(); return; } navSet(j); syncControls(); refresh(); }
 function togglePlay() {
   S.playing = !S.playing; $('#play').textContent = S.playing ? '❚❚' : '▶'; $('#play').setAttribute('aria-label', S.playing ? 'Pause' : 'Play');
   clearInterval(S.timer);
-  if (S.playing) { if (S.idx >= S.steps.length - 1) { S.idx = 0; } S.timer = setInterval(() => { if (!$('#busy').hidden) return; step(1); }, 650); }
+  if (S.playing) { if (navPos() >= navLen() - 1) navSet(0); S.timer = setInterval(() => { if (!$('#busy').hidden) return; step(1); }, 650); }
 }
 
 /* ============================================================================= boot */
@@ -663,7 +806,9 @@ async function boot() {
   if (hs.w === 'member') S.wmode = 'member';
   const first = [hs.m, 'blend', ...FAM_KEYS].find((f) => f && setFamily(f, true));           // the requested view, else the best one that has data
   const want = +hs.f || 24; S.idx = nearestIdx(want);
-  S.product = ['qpf', 'snow', 'zr', 'pl', 'ptype'].includes(hs.p) && S.products.includes(hs.p) ? hs.p : 'qpf';
+  S.product = ['qpf', 'snow', 'zr', 'pl', 'ptype', 'tmax', 'tmin'].includes(hs.p) && S.products.includes(hs.p) ? hs.p : 'qpf';
+  if (/^\d{8}$/.test(hs.d || '')) S.day = `${hs.d.slice(0, 4)}-${hs.d.slice(4, 6)}-${hs.d.slice(6)}`;
+  fixDay();
   S.period = S.product === 'ptype' ? 'step' : hs.per === 'step' ? 'step' : [6, 12, 24, 48].includes(+hs.per) ? +hs.per : 24;
   if (hs.s) S.stat = hs.s === 'median' ? 'p50' : hs.s;
   if ([2, 4, 6, 8].includes(+hs.r)) S.lpmmR = +hs.r;

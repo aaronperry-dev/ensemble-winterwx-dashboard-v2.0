@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <link rel="icon" href="data:,">
-<title>Ensemble Winter Weather — GEFS · IFS ENS · GEPS blend — QPF · Snow · Ice · Precipitation Type</title>
-<meta name="description" content="GEFS, ECMWF IFS ENS and GEPS ensemble QPF, snowfall, freezing rain, sleet and Revised Bourgouin precipitation type, alone or blended, with rolling 6/12/24/48-hour accumulations, 10 days out.">
+<title>Ensemble Winter Weather — GEFS · IFS ENS · GEPS blend — QPF · Snow · Ice · Precipitation Type · MaxT/MinT</title>
+<meta name="description" content="GEFS, ECMWF IFS ENS and GEPS ensemble QPF, snowfall, freezing rain, sleet and Revised Bourgouin precipitation type, alone or blended, with rolling 6/12/24/48-hour accumulations and daily maximum and minimum temperature, 10 days out.">
 <link rel="stylesheet" href="maplibre-gl.css">
 <link rel="stylesheet" href="style.css">
 </head>
@@ -82,7 +82,8 @@
     <p><b>Blend.</b> The blend pools the members of the models that share the same initialization time (GEFS is matched to the newest 00/12Z cycle the others have) at the forecast hours all three provide. The default weights each model equally, so one GEFS member counts 1/31 of a third, an IFS member 1/50 and a GEPS member 1/21; &ldquo;Equal by member&rdquo; instead counts every member the same. Percentiles, probabilities, means, PMM and LPMM are all weighted, and the tooltip shows each model's own value next to the blend. A model that has not finished or is on an older run is left out and noted in the panel.</p>
     <p><b>Statistics</b> are computed per grid cell from the member totals (percentiles interpolate between ranked members, or between weighted ranks in the blend). <b>PMM</b> (Ebert 2001) keeps the ensemble-mean pattern but takes its amplitudes from all members pooled over the map; <b>LPMM</b> (Clark 2017; Snook et&nbsp;al.) does the same inside a neighborhood around each point.</p>
     <p><b>Periods</b> are rolling windows ending at the selected hour. Before the window fits in the run, the total since initialization is shown.</p>
-    <p>Hover (desktop) or tap (phone) the map for the ensemble breakdown at that point. Click to pin.</p>
+    <p><b>Daily MaxT / MinT.</b> Each member's highest 2&nbsp;m temperature from 12Z to 00Z (7&nbsp;am&ndash;7&nbsp;pm EST) and lowest from 00Z to 12Z (7&nbsp;pm&ndash;7&nbsp;am EST), the NWS convention for daytime highs and overnight lows in the Eastern time zone; the date is the UTC date the window starts on. The values are the true extremes the models write for each 3- or 6-hour interval (GEFS <code>TMAX/TMIN</code>, IFS ENS <code>mx2t3/mn2t3/mx2t6/mn2t6</code>, GEPS <code>TMAX/TMIN_TGL_2m</code>), not the highest or lowest of the hourly or 6-hourly snapshots, which miss the peak between them. A window is shown only when every interval in it is in and, in the blend, every model has it, so the first and last half-days of a run are left out. Colors follow the WPC maximum/minimum temperature legend (5&deg;F classes). The period selector does not apply; the slider steps through days.</p>
+  <p>Hover (desktop) or tap (phone) the map for the ensemble breakdown at that point. Click to pin.</p>
     <p class="fine">Data: NOAA/NCEP GEFS 0.5&deg;; ECMWF IFS ENS open data (CC BY 4.0); Environment and Climate Change Canada GEPS (Open Government Licence &ndash; Canada). Basemap: Natural Earth, US Census cartographic boundaries.</p>
   </details>
   <div id="t-gen" class="fine"></div>
@@ -115,6 +116,7 @@
 <script src="wxlayer.js"></script>
 <script src="basemap.js"></script>
 <script src="ensstats.js"></script>
+<script src="tempdays.js"></script>
 <script src="viewer.js"></script>
 </body>
 </html>

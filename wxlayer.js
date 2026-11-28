@@ -19,7 +19,7 @@ uniform sampler2D u_val; uniform sampler2D u_typ; uniform sampler2D u_lut;
 uniform vec4 u_dom;      // lon_west, lat_north, dlon, dlat
 uniform vec2 u_dim;      // nx, ny
 uniform float u_opacity; uniform int u_mode; uniform int u_n;
-uniform float u_edges[16]; uniform vec4 u_cols[16];
+uniform float u_edges[32]; uniform vec4 u_cols[32];
 uniform vec3 u_dbz;      // dbz min, step, count
 in vec2 v_merc; out vec4 o;
 const float PI = 3.14159265358979;
@@ -33,7 +33,7 @@ void main() {
   float v = mix(mix(F(i0), F(i0 + ivec2(1, 0)), f.x), mix(F(i0 + ivec2(0, 1)), F(i0 + ivec2(1, 1)), f.x), f.y);
   vec4 c = vec4(0.0);
   if (u_mode == 0) {
-    for (int i = 0; i < 16; i++) { if (i < u_n && v >= u_edges[i]) c = u_cols[i]; }
+    for (int i = 0; i < 32; i++) { if (i < u_n && v >= u_edges[i]) c = u_cols[i]; }
   } else {
     if (v >= u_dbz.x) {
       ivec2 nn = clamp(ivec2(floor(vec2(gx, gy) + 0.5)), ivec2(0), ivec2(u_dim) - 1);
@@ -52,7 +52,7 @@ class WxLayer {
     this.id = 'wx'; this.type = 'custom'; this.renderingMode = '2d';
     this.opacity = opts.opacity ?? 0.82;
     this.mode = 0; this.n = 0;
-    this.edges = new Float32Array(16); this.cols = new Float32Array(64);
+    this.edges = new Float32Array(32); this.cols = new Float32Array(128);
     this.dom = null; this.ready = false; this.hasField = false;
     this.lutDims = [33, 4];
   }
@@ -120,7 +120,7 @@ class WxLayer {
 
   /** Classed colors: edges ascending (display units), colors as CSS hex strings. */
   setClasses(edges, colors) {
-    this.mode = 0; this.n = Math.min(16, edges.length);
+    this.mode = 0; this.n = Math.min(32, edges.length);
     this.edges.fill(0); this.cols.fill(0);
     for (let i = 0; i < this.n; i++) {
       this.edges[i] = edges[i];

@@ -125,7 +125,7 @@ Run it locally:
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest -q tests && node --test tests/ensstats.test.js
+python -m pytest -q tests && node --test tests/ensstats.test.js tests/tempdays.test.js
 python -m pipeline.run --out site/data --max-fhr 48 --workers 6      # add --min-members 20 --straggler-minutes 15 to tune
 python -m pipeline.site --out site
 cd site && python -m http.server 8000
@@ -162,7 +162,7 @@ Every deploy builds a fresh site, so the only copy of a finished cycle is the on
 * if the cycle is partial, restores the running accumulators from the published files and downloads **only the missing hours**. Members dropped earlier stay dropped. Restored totals carry at most one file-quantization step of rounding (0.05 mm QPF, 0.1 cm snow);
 * falls back to a normal download when the cycle, code, members or snow mode differ, when no site exists yet, or from the first hour whose file is missing or damaged.
 
-Run the workflow by hand with `force_refresh` = true (or pass `--force`) to download everything again, for example to pick up members that were dropped on the first attempt. `code_rev` covers `bourgouin.py`, `config.py`, `encode.py`, `families.py`, `geps.py`, `grib.py`, `ifs.py`, `member.py`, `products.py` and `run.py`; changes to the source/transport code or to the viewer do not invalidate published data.
+Run the workflow by hand with `force_refresh` = true (or pass `--force`) to download everything again, for example to pick up members that were dropped on the first attempt. `code_rev` covers `bourgouin.py`, `config.py`, `encode.py`, `families.py`, `geps.py`, `grib.py`, `ifs.py`, `member.py`, `products.py`, `run.py` and `tempext.py`; changes to the source/transport code or to the viewer do not invalidate published data.
 
 ## Data format (`data/<model>/<yyyymmdd_cc>/…`, `data/<model>/latest.json`)
 
@@ -170,6 +170,8 @@ Run the workflow by hand with `force_refresh` = true (or pass `--force`) to down
 
 * `cum/fHHH.bin.gz`: **cumulative-since-init** `u16 [member][y][x]` arrays, in order: QPF (0.05 mm per count), snowfall (0.1 cm), freezing rain (0.01 mm liquid equivalent), sleet (0.01 mm liquid equivalent), snow liquid equivalent (0.02 mm, the fifth array). The header's `narr` byte gives the array count, so older 2- and 4-array files still read; the fifth scale sits at header offset 52.
 * `ptype/fHHH.bin.gz`: `u8 [4][member][y][x]` = % RA, SN, FZRA, PL (0 where the member's 3-hr QPF is below 0.05 mm).
+
+* `tmp/tmaxNN.bin.gz`, `tmp/tminNN.bin.gz` (one per window, listed under `temps` in the manifest): `u16 [member][y][x]`, kind 3, deg C = −100 + count × 0.05 (0 = no data). The header's `fhr` slot holds the window index and `step_h` the number of 6-hour blocks folded in. Manifest entries carry `date`, `file`, `expected` and `blocks` (a window is complete when `blocks == expected` and `expected` is 2), `n` members and their `mask`.
 
 Cumulative storage means any rolling 3/6/12/24/48-hour total is just `cum(t) − cum(t−w)`, two small files fetched
 by the browser. A full GEFS run is about 25 MB (IFS about 40 MB, GEPS about 20 MB). Domain: 60–20°N, 135–50°W, 0.5° (81 × 171). The 64-byte `GWX1` header is
@@ -192,13 +194,23 @@ documented in `pipeline/encode.py`; its member bitmask spans 64 members (bits 0�
 * Speed: QPF, snowfall, freezing rain and sleet share the same cumulative files, so switching among them reuses data already in memory (about 15 ms). After each view loads, the browser quietly prefetches, one file at a time at idle priority, the precip-type file, the start files for the other accumulation periods, and the next three hours in whichever direction you are stepping. It skips this when Data Saver or a 2G connection is on. PMM and LPMM run in a Web Worker (`statworker.js`) so the map stays responsive, and finished fields are memoized. Decoded files are held under a memory budget (90 MB on low-memory phones, 220 MB otherwise).
 * State is kept in the URL hash, so links are shareable.
 
+## Daily maximum and minimum temperature
+
+Two extra products, **Daily MaxT** and **Daily MinT**, are published for every model that supplies window extremes, 10 days out.
+
+* **Windows (UTC, labelled by the date they start on).** MaxT = 12Z to 00Z (7 am to 7 pm EST); MinT = 00Z to 12Z (7 pm to 7 am EST). They are set in `pipeline/config.py` (`TEMP_WINDOWS_UTC`). The viewer shows each window in the viewer's own time zone as well as in UTC.
+* **True extremes, not snapshots.** Each model writes the highest and lowest 2 m temperature over its output interval, and the pipeline takes the max / min of those: GEFS `TMAX`/`TMIN` (6-hour windows; 3-hour windows at odd hours are ignored), IFS ENS `mx2t3`/`mn2t3` (3-hour, to F144) then `mx2t6`/`mn2t6` (6-hour), GEPS `TMAX`/`TMIN_TGL_2m` (6-hour, at the 6-hourly files only). A 12-hour window is two 6-hour blocks (four 3-hour IFS intervals pair up into two blocks); a window is published only when both blocks are in, so the first and last half-days of a run are omitted. IFS stores 2 m temperature and its window extremes under the same GRIB parameter codes, separated only by `stepType`; `grib.identify` tells them apart.
+* **Missing data.** The extremes are optional. A member or file that is missing is left out of that window only (each window has its own member mask, shown in the viewer's warning line), a model with no extremes publishes none, and GEPS extremes that are not on the server never stall the run. Interrupted runs resume at the next 6-hour boundary with the running maxima and minima restored from the published window files.
+* **Viewer.** Pick *Daily MaxT* or *Daily MinT*. The slider, ◀ ▶ and play step through days instead of forecast hours; the period selector is not used. All the statistics (min, percentiles, mean, max), a single member, and the chance of being at or below / at or above a threshold are available (MaxT: ≤20, ≤32, ≥50, ≥70, ≥90, ≥100 °F; MinT: ≤−10, ≤0, ≤20, ≤32, ≥60, ≥70 °F); PMM/LPMM are for precipitation and are not offered. The blend pools the members of the models that all have that window, weighted as for the other products. Temperatures are in °F to tenths. The URL keeps `p=tmax|tmin` and `d=YYYYMMDD`.
+* **Colors.** The classes (5 °F, from below −40 to 100 +) follow the WPC maximum / minimum temperature legend; the chance-of maps use blue ramps for cold thresholds and orange/red ramps for warm ones. `tempdays.js` holds the ramp, windows and day-matching logic and is tested with `node --test tests/tempdays.test.js`.
+
 ## Layout
 
 ```
 pipeline/        data pipeline (python -m pipeline.run --family gefs|ifs|geps, pipeline.site); pipeline/reuse.py skips hours already published
                  families.py (the three models), ifs.py and geps.py (their fetchers), run.py (shared orchestration)
 tests/           pytest suite, no network needed
-index.html style.css viewer.js basemap.js wxlayer.js colors.js ensstats.js statworker.js   viewer
+index.html style.css viewer.js basemap.js wxlayer.js colors.js tempdays.js ensstats.js statworker.js   viewer
 basemap_*.json   boundaries and labels (build_basemap.py regenerates them)
 maplibre-gl.*    vendored MapLibre
 .github/workflows/gefs.yml
