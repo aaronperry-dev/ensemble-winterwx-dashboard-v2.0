@@ -44,6 +44,7 @@ const S = {
   sets: {}, fam: 'blend', wmode: 'model', note: '',          // loaded manifests; selected model; blend weighting
   src: [], all: [], off: {}, init: '', domain: null, gen: '', complete: true, products: null,
   steps: [], byFhr: new Map(), idx: 0,
+  stn: false, stations: null,                                 // station-value layer on/off; New England METAR/ASOS list (stations.json)
   tdays: {}, day: '',                                       // daily MaxT / MinT: per product, the dates every pooled model has; the selected date
   product: 'qpf', period: 24, stat: 'mean', lpmmR: 4, slr: 'kuchera', hasSwe: false, opacity: 0.82,
   cur: null, token: 0, pin: null, playing: false, timer: null,
@@ -299,7 +300,7 @@ async function refresh() {
       const { field, types } = buildPtype(d, S.stat);
       if (isProb(S.stat)) { const c = classesFor(); wx.setClasses(c.edges, c.colors); }
       else wx.setPtypeLut(PTYPE.ramps, PTYPE.names, PTYPE.dbzMin, PTYPE.dbzStep);
-      wx.setField(field, types); S.cur = { kind: 'ptype', d, field };
+      wx.setField(field, types); S.cur = { kind: 'ptype', d, field, types };
     } else if (tempMode()) {
       const win = await tempValues(S.product, S.day); if (tok !== S.token) return;
       const field = reduceTemp(win, S.stat);
@@ -311,7 +312,7 @@ async function refresh() {
       const c = classesFor(); wx.setClasses(c.edges, c.colors); wx.setField(field);
       S.cur = { kind: S.product, win, field };
     }
-    updateLegend(); updateTitle(); updateTip(); prefetch();
+    updateLegend(); updateTitle(); updateTip(); updateStations(); prefetch();
   } catch (e) { console.error(e); toast(`Could not load data: ${e.message}`); }
   finally { if (tok === S.token) $('#busy').hidden = true; }
 }
@@ -460,6 +461,26 @@ function updateLegend() {
     const row = document.createElement('div'); row.className = 'lg-row';
     row.innerHTML = `<i style="background:${c.colors[i]}"></i><span>${c.labels[i]}</span>`; el.appendChild(row);
   }
+}
+
+/* ============================================================================= station values */
+/** Print the value of the map being shown at each New England METAR/ASOS site (same field, same grid interpolation as the colours). */
+function updateStations() {
+  if (!labels) return;
+  const cur = S.cur;
+  if (!S.stn || !S.stations || !cur || !cur.field || !S.domain) { labels.stations = null; labels.q(); return; }
+  const N = S.domain.nx * S.domain.ny, prob = isProb(S.stat);
+  labels.stations = S.stations.map((s) => {
+    const c = cellValues({ lng: s.lon, lat: s.lat }, cur.field, 1, N);
+    if (!c) return { id: s.id, lon: s.lon, lat: s.lat, txt: '' };
+    const type = cur.kind === 'ptype' && cur.types ? cur.types[c.nearest] : -1;
+    return { id: s.id, lon: s.lon, lat: s.lat, txt: Stations.format({ product: cur.kind, prob, v: c.v[0], type }) };
+  });
+  labels.q();
+}
+function loadStations() {
+  return fetch('stations.json').then((r) => (r.ok ? r.json() : Promise.reject(new Error(r.status)))).then((l) => { S.stations = Stations.order(l); })
+    .catch(() => { S.stations = null; const el = $('#tg-stations'); if (el) el.closest('label').hidden = true; });
 }
 
 /* ============================================================================= tooltip */
@@ -726,7 +747,7 @@ function syncControls() {
   document.querySelectorAll('#product button').forEach((b) => b.classList.toggle('on', b.dataset.v === S.product));
   document.querySelectorAll('#period button').forEach((b) => { b.classList.toggle('on', !tempMode() && String(b.dataset.v) === String(S.period)); b.disabled = tempMode() || (S.product === 'ptype' && b.dataset.v !== 'step'); });
   $('#period-note').hidden = S.product !== 'ptype' && !tempMode(); $('#period-note').textContent = tempMode() ? '(not used: one value per day)' : '(type is per output step)';
-  location.hash = `m=${S.fam}${S.src.length > 1 && S.wmode !== 'model' ? `&w=${S.wmode}` : ''}&p=${S.product}${tempMode() ? '' : `&per=${S.period}`}&s=${S.stat}${S.stat === 'lpmm' ? `&r=${S.lpmmR}` : ''}${S.product === 'snow' && S.hasSwe && S.slr !== 'kuchera' ? `&slr=${S.slr}` : ''}${tempMode() ? `&d=${S.day.replace(/-/g, '')}` : `&f=${S.steps[S.idx].fhr}`}`;
+  location.hash = `m=${S.fam}${S.src.length > 1 && S.wmode !== 'model' ? `&w=${S.wmode}` : ''}&p=${S.product}${tempMode() ? '' : `&per=${S.period}`}&s=${S.stat}${S.stat === 'lpmm' ? `&r=${S.lpmmR}` : ''}${S.product === 'snow' && S.hasSwe && S.slr !== 'kuchera' ? `&slr=${S.slr}` : ''}${tempMode() ? `&d=${S.day.replace(/-/g, '')}` : `&f=${S.steps[S.idx].fhr}`}${S.stn ? '&st=1' : ''}`;
 }
 
 function renderProducts() {
@@ -767,6 +788,7 @@ function buildUI() {
   const vis = (id, layers) => ($(id).onchange = (e) => layers.forEach((l) => map.setLayoutProperty(l, 'visibility', e.target.checked ? 'visible' : 'none')));
   vis('#tg-counties', ['counties-line']); vis('#tg-states', ['admin1-line']); vis('#tg-rivers', ['rivers']); vis('#tg-grat', ['graticule']);
   $('#tg-labels').onchange = (e) => { labels.show.places = labels.show.admin1 = labels.show.water = labels.show.countries = e.target.checked; labels.q(); };
+  $('#tg-stations').onchange = (e) => { S.stn = e.target.checked; labels.show.stations = S.stn; updateStations(); syncControls(); };
   $('#tg-grat').addEventListener('change', (e) => { labels.show.graticule = e.target.checked; labels.q(); });
   $('#views').onclick = (e) => {
     const b = e.target.closest('button'); if (!b) return;
@@ -813,6 +835,8 @@ async function boot() {
   if (hs.s) S.stat = hs.s === 'median' ? 'p50' : hs.s;
   if ([2, 4, 6, 8].includes(+hs.r)) S.lpmmR = +hs.r;
   if (S.hasSwe && ['10', '12', '13'].includes(hs.slr)) S.slr = hs.slr;
+  S.stn = hs.st === '1';
+  const stationsReady = loadStations();
   await new Promise((res) => (map.loaded() ? res() : map.once('load', res)));
   wx = new WxLayer({ opacity: S.opacity }); wx.setDomain(S.domain);
   map.addLayer(wx, 'counties-hit');
@@ -825,7 +849,8 @@ async function boot() {
   map.on('mouseout', () => { if (!recentTouch()) hideTip(); });
   map.on('click', (e) => { if (recentTouch() && S.pin) unpin(); pin(e); });
   map.on('dragstart', () => hideTip());
-  buildUI(); syncControls();
+  buildUI(); $('#tg-stations').checked = S.stn; labels.show.stations = S.stn; syncControls();
+  stationsReady.then(() => updateStations());
   $('#splash').hidden = true;
   $('#t-gen').textContent = `Built ${new Date(S.gen).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' })}${S.complete ? '' : ' \u00b7 run still filling in'}`;
   refresh();

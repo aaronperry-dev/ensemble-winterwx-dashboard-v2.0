@@ -71,7 +71,8 @@ function updateGraticule(map) {
 class LabelLayer {
   constructor(map, canvas, data) {
     this.map = map; this.cv = canvas; this.ctx = canvas.getContext('2d'); this.d = data;
-    this.show = { places: true, admin1: true, water: true, countries: true, graticule: true };
+    this.show = { places: true, admin1: true, water: true, countries: true, graticule: true, stations: false };
+    this.stations = null;                 // [{id, lon, lat, txt}] in drawing-priority order; set by the viewer
     this.step = 10; this.queued = false;
     const q = () => { if (!this.queued) { this.queued = true; requestAnimationFrame(() => { this.queued = false; this.draw(); }); } };
     map.on('render', q); window.addEventListener('resize', q);
@@ -108,6 +109,20 @@ class LabelLayer {
     const proj = (lon, lat) => map.project([lon, lat]);
     const F = (size, w = 400, style = '') => `${style} ${w} ${size}px ${BM.font}`.trim();
 
+    /* priority 0: station values (METAR/ASOS sites); drawn first so they win every overlap, place names give way */
+    if (this.show.stations && this.stations) {
+      const sz = z >= 7 ? 13 : 12;
+      for (const s of this.stations) {
+        if (!s.txt) continue;
+        const p = proj(s.lon, s.lat); if (!inView(p)) continue;
+        const dot = { x1: p.x - 3.5, x2: p.x + 3.5, y1: p.y - 3.5, y2: p.y + 3.5 };
+        if (hit(dot)) continue;
+        if (!text(s.txt, p.x, p.y - 9, { font: F(sz, 700), size: sz, color: '#0b0b0b', halo: 3.4, extra: dot })) continue;
+        ctx.beginPath(); ctx.arc(p.x, p.y, 2.6, 0, Math.PI * 2); ctx.fillStyle = '#0b0b0b'; ctx.fill(); ctx.lineWidth = 1.2; ctx.strokeStyle = '#fff'; ctx.stroke();
+        placed.push(dot);
+        if (z >= 7.5) text(s.id, p.x, p.y + 9, { font: F(10, 600), size: 10, color: '#3a3a3a', halo: 2.5 });
+      }
+    }
     /* priority 1: country + water names */
     if (this.show.countries && z < 7) this.d.countries.forEach(([n, lon, lat, rank]) => {
       if (rank > 3 + (z > 4 ? 0 : -1)) return; const p = proj(lon, lat); if (!inView(p)) return;

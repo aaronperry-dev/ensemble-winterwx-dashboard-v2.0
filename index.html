@@ -65,6 +65,7 @@
     <label><input id="tg-rivers" type="checkbox" checked> Rivers</label>
     <label><input id="tg-grat" type="checkbox" checked> Graticule</label>
     <label><input id="tg-labels" type="checkbox" checked> Place labels</label>
+    <label><input id="tg-stations" type="checkbox"> Station values (N.E. ASOS)</label>
   </div>
 
   <label class="lbl">Zoom to</label>
@@ -83,6 +84,7 @@
     <p><b>Statistics</b> are computed per grid cell from the member totals (percentiles interpolate between ranked members, or between weighted ranks in the blend). <b>PMM</b> (Ebert 2001) keeps the ensemble-mean pattern but takes its amplitudes from all members pooled over the map; <b>LPMM</b> (Clark 2017; Snook et&nbsp;al.) does the same inside a neighborhood around each point.</p>
     <p><b>Periods</b> are rolling windows ending at the selected hour. Before the window fits in the run, the total since initialization is shown.</p>
     <p><b>Daily MaxT / MinT.</b> Each member's highest 2&nbsp;m temperature from 12Z to 00Z (7&nbsp;am&ndash;7&nbsp;pm EST) and lowest from 00Z to 12Z (7&nbsp;pm&ndash;7&nbsp;am EST), the NWS convention for daytime highs and overnight lows in the Eastern time zone; the date is the UTC date the window starts on. The values are the true extremes the models write for each 3- or 6-hour interval (GEFS <code>TMAX/TMIN</code>, IFS ENS <code>mx2t3/mn2t3/mx2t6/mn2t6</code>, GEPS <code>TMAX/TMIN_TGL_2m</code>), not the highest or lowest of the hourly or 6-hourly snapshots, which miss the peak between them. A window is shown only when every interval in it is in and, in the blend, every model has it, so the first and last half-days of a run are left out. Colors follow the WPC maximum/minimum temperature legend (5&deg;F classes). The period selector does not apply; the slider steps through days.</p>
+  <p><b>Station values</b> (Map layers) prints the value of the map being shown, with the same grid interpolation as the colors, at 84 New England ASOS/AWOS sites: whatever product and statistic is selected (mean, a percentile, a single member, a chance), in the same units. Snowfall to tenths, QPF/freezing rain/sleet to hundredths, temperatures to whole degrees, chances to whole percent; for precipitation type, the most likely type where there is precipitation. These are model values interpolated from the 0.5&deg; grid, not station forecasts and not observations, so a site on the coast or in a valley can differ from what the nearby grid points show. At close zoom the site ID appears under the value.</p>
   <p>Hover (desktop) or tap (phone) the map for the ensemble breakdown at that point. Click to pin.</p>
     <p class="fine">Data: NOAA/NCEP GEFS 0.5&deg;; ECMWF IFS ENS open data (CC BY 4.0); Environment and Climate Change Canada GEPS (Open Government Licence &ndash; Canada). Basemap: Natural Earth, US Census cartographic boundaries.</p>
   </details>
@@ -117,6 +119,7 @@
 <script src="basemap.js"></script>
 <script src="ensstats.js"></script>
 <script src="tempdays.js"></script>
+<script src="stations.js"></script>
 <script src="viewer.js"></script>
 </body>
 </html>

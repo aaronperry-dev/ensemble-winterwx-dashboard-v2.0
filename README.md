@@ -125,7 +125,7 @@ Run it locally:
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest -q tests && node --test tests/ensstats.test.js tests/tempdays.test.js
+python -m pytest -q tests && node --test tests/ensstats.test.js tests/tempdays.test.js tests/stations.test.js
 python -m pipeline.run --out site/data --max-fhr 48 --workers 6      # add --min-members 20 --straggler-minutes 15 to tune
 python -m pipeline.site --out site
 cd site && python -m http.server 8000
@@ -192,6 +192,7 @@ documented in `pipeline/encode.py`; its member bitmask spans 64 members (bits 0â
   * Probability of at least *x*, and any single member. Everything in the viewer is shown in imperial units: inches for QPF, snowfall, freezing rain and sleet, and miles/feet on the scale bar. (The data files keep mm/cm internally; conversion happens in the browser.)
   * The PMM/LPMM math is in `ensstats.js` and tested with `node --test tests/ensstats.test.js` (distribution matching, rank order, equality with PMM for a map-sized window, brute-force comparison).
 * Speed: QPF, snowfall, freezing rain and sleet share the same cumulative files, so switching among them reuses data already in memory (about 15 ms). After each view loads, the browser quietly prefetches, one file at a time at idle priority, the precip-type file, the start files for the other accumulation periods, and the next three hours in whichever direction you are stepping. It skips this when Data Saver or a 2G connection is on. PMM and LPMM run in a Web Worker (`statworker.js`) so the map stays responsive, and finished fields are memoized. Decoded files are held under a memory budget (90 MB on low-memory phones, 220 MB otherwise).
+* **Station values** (Map layers, off by default; `st=1` in the URL). Prints the value of the map on screen at each of 84 New England ASOS/AWOS sites listed in `stations.json` (the station set from the New England Blizzard Atlas: CT 11, MA 24, ME 20, NH 12, RI 6, VT 11): the same field and the same bilinear grid interpolation as the colors, so it follows the selected product, statistic, member, probability and day. Precision is snowfall to tenths, QPF/freezing rain/sleet to hundredths, temperatures to whole degrees and chances to whole percent; for precipitation type it prints the most likely type (RA, SN, ZR, PL) where there is precipitation. The labels are drawn on the label canvas ahead of place names, ASOS before AWOS, and a station whose label would overlap one already drawn is skipped, so zooming in reveals more; the site ID appears at close zoom. They are model values on a 0.5Â° grid, not station forecasts. Formatting lives in `stations.js` (`node --test tests/stations.test.js`). To change the site list, edit `stations.json` (`id`, `name`, `state`, `lat`, `lon`, `type`, `seasons`; `seasons` only sets drawing priority).
 * State is kept in the URL hash, so links are shareable.
 
 ## Daily maximum and minimum temperature
@@ -210,7 +211,7 @@ Two extra products, **Daily MaxT** and **Daily MinT**, are published for every m
 pipeline/        data pipeline (python -m pipeline.run --family gefs|ifs|geps, pipeline.site); pipeline/reuse.py skips hours already published
                  families.py (the three models), ifs.py and geps.py (their fetchers), run.py (shared orchestration)
 tests/           pytest suite, no network needed
-index.html style.css viewer.js basemap.js wxlayer.js colors.js tempdays.js ensstats.js statworker.js   viewer
+index.html style.css viewer.js basemap.js wxlayer.js colors.js tempdays.js stations.js stations.json ensstats.js statworker.js   viewer
 basemap_*.json   boundaries and labels (build_basemap.py regenerates them)
 maplibre-gl.*    vendored MapLibre
 .github/workflows/gefs.yml
